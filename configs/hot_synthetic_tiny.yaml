@@ -1,0 +1,37 @@
+# Homeostatic Transformer (HoT) — synthetic bracket-matching, tiny config.
+# Fast smoke-test config: runs to completion in a few minutes on CPU,
+# and under 2 minutes on a T4 GPU in Colab.
+
+run_name: synthetic_tiny
+
+model:
+  d_model: 64
+  n_layers: 4
+  n_heads: 4
+  conv_kernel_size: 7
+  dropout: 0.1
+  gate_temperature: 0.05     # sigmoid sharpness for soft routing during training
+
+data:
+  dataset: synthetic_bracket  # built-in task, no external download required
+  seq_len: 64
+  batch_size: 32
+  vocab_size: 4               # 0='(', 1=')', 2-3 unused (safe margin)
+  n_classes: 2
+  seed: 42
+
+training:
+  steps: 10000
+  lr: 0.001
+  weight_decay: 0.01
+  grad_clip: 1.0
+  eval_every: 500
+  save_dir: runs/
+
+czu:
+  warmup_steps: 1000          # force Path C for first 1000 steps, collect entropy stats
+  update_every: 500           # EMA threshold update interval (steps)
+  ema_beta: 0.95              # EMA decay for threshold updates
+
+logging:
+  log_every: 100
