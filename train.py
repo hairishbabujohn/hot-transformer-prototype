@@ -146,7 +146,7 @@ def main() -> None:
     # ---- Run directory ----
     run_name = (
         f"hot_{cfg.get('run_name', 'exp')}_"
-        f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+        f"{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     )
     run_dir = os.path.join(tcfg.get("save_dir", "runs"), run_name)
     os.makedirs(run_dir, exist_ok=True)

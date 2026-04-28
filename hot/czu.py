@@ -31,9 +31,10 @@ class CZU:
         n_layers:      Number of HoT layers in the model.
         warmup_steps:  Steps to force Path C and collect entropy stats (default 1000).
         update_every:  Steps between EMA threshold updates after warmup (default 500).
-        ema_beta:      EMA decay factor for threshold updates (default 0.95).
-        init_H_low:    Default H_low before warmup finishes (default 0.3).
-        init_H_high:   Default H_high before warmup finishes (default 0.7).
+        ema_beta:          EMA decay factor for threshold updates (default 0.95).
+        init_H_low:        Default H_low before warmup finishes (default 0.3).
+        init_H_high:       Default H_high before warmup finishes (default 0.7).
+        min_threshold_gap: Minimum enforced gap between H_low and H_high (default 0.05).
     """
 
     def __init__(
@@ -44,11 +45,14 @@ class CZU:
         ema_beta: float = 0.95,
         init_H_low: float = 0.3,
         init_H_high: float = 0.7,
+        min_threshold_gap: float = 0.05,
     ) -> None:
         self.n_layers = n_layers
         self.warmup_steps = warmup_steps
         self.update_every = update_every
         self.ema_beta = ema_beta
+
+        self.min_threshold_gap = min_threshold_gap
 
         self.step = 0
         self.initialized = False   # True once thresholds are set from warmup data
@@ -145,10 +149,11 @@ class CZU:
                 low = float(np.percentile(buf, 10))
                 high = float(np.percentile(buf, 90))
                 # Enforce a minimum gap to avoid degenerate routing
-                if high - low < 0.05:
+                if high - low < self.min_threshold_gap:
+                    half = self.min_threshold_gap / 2.0
                     mid = (low + high) / 2.0
-                    low = max(0.0, mid - 0.025)
-                    high = min(1.0, mid + 0.025)
+                    low = max(0.0, mid - half)
+                    high = min(1.0, mid + half)
                 self.H_low[i] = low
                 self.H_high[i] = high
 

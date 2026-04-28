@@ -13,6 +13,7 @@ External datasets (optional, with graceful fallback)
                            Falls back to ``synthetic_bracket`` if unavailable.
 """
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -37,8 +38,6 @@ def bracket_matching_dataset(
     Returns:
         (seqs, labels): LongTensors of shape (n_samples, seq_len) and (n_samples,).
     """
-    import numpy as np
-
     assert seq_len % 2 == 0, "seq_len must be even for bracket matching"
     rng = np.random.default_rng(seed)
     half = n_samples // 2

@@ -184,7 +184,7 @@ class HoTLayer(nn.Module):
         # Soft gates derived from the entropy scalar
         w_a = torch.sigmoid((H_low_t - h) / temp)    # peaks when h << H_low
         w_c = torch.sigmoid((h - H_high_t) / temp)   # peaks when h >> H_high
-        w_b = (1.0 - w_a - w_c).clamp(min=1e-7)
+        w_b = (1.0 - w_a - w_c).clamp(min=0.0)
 
         # Normalize so weights sum to 1
         total = w_a + w_b + w_c
