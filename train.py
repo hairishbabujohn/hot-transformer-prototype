@@ -20,6 +20,7 @@ from datetime import datetime
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import yaml
 
 from hot.model import HoTEncoder
@@ -107,6 +108,7 @@ def main() -> None:
     tcfg = cfg.get("training", {})
     zcfg = cfg.get("czu", {})
     lcfg = cfg.get("logging", {})
+    rcfg = cfg.get("routing_reg", {})
 
     # ---- Data ----
     train_loader, val_loader, n_classes = get_dataloaders(dcfg)
@@ -133,7 +135,21 @@ def main() -> None:
         warmup_steps=zcfg.get("warmup_steps", 1000),
         update_every=zcfg.get("update_every", 500),
         ema_beta=zcfg.get("ema_beta", 0.95),
+        h_low_clamp=(
+            zcfg.get("h_low_clamp_min", 0.2),
+            zcfg.get("h_low_clamp_max", 0.75),
+        ),
+        h_high_clamp=(
+            zcfg.get("h_high_clamp_min", 0.35),
+            zcfg.get("h_high_clamp_max", 0.90),
+        ),
+        schedule_steps=zcfg.get("schedule_steps", 2000),
     )
+
+    # ---- Routing regularization hyperparameters ----
+    lambda_balance = rcfg.get("lambda_balance", 0.05)
+    lambda_compute = rcfg.get("lambda_compute", 0.02)
+    target_dist = rcfg.get("target_dist", [1 / 3, 1 / 3, 1 / 3])
 
     # ---- Optimizer ----
     optimizer = torch.optim.AdamW(
@@ -178,6 +194,32 @@ def main() -> None:
         logits, oem_vals, routes = model(x, thresholds, force_c=force_c)
         loss = criterion(logits, y)
 
+        # ---- Routing regularization (post-warmup only) ----
+        reg_loss_val = 0.0
+        if not force_c and (lambda_balance > 0 or lambda_compute > 0):
+            route_tensors = [r for r in routes if isinstance(r, torch.Tensor)]
+            if route_tensors:
+                # avg_w shape: (3,) — mean routing weight [w_A, w_B, w_C]
+                avg_w = torch.stack(route_tensors).mean(dim=0)
+
+                if lambda_balance > 0:
+                    # KL(target || avg_w): minimising this pushes avg_w toward
+                    # the target distribution, preventing collapse to all-C.
+                    tgt = torch.tensor(
+                        target_dist, dtype=avg_w.dtype, device=avg_w.device
+                    )
+                    l_bal = F.kl_div(
+                        avg_w.clamp(min=1e-8).log(), tgt, reduction="sum"
+                    )
+                    loss = loss + lambda_balance * l_bal
+                    reg_loss_val += (lambda_balance * l_bal).item()
+
+                if lambda_compute > 0:
+                    # Compute-cost penalty: penalise heavy use of Path C (O(N²)).
+                    l_cmp = avg_w[2]
+                    loss = loss + lambda_compute * l_cmp
+                    reg_loss_val += (lambda_compute * l_cmp).item()
+
         # ---- Backward ----
         optimizer.zero_grad()
         loss.backward()
@@ -200,6 +242,7 @@ def main() -> None:
             )
             print(
                 f"step={step}/{total_steps} loss={loss.item():.4f} "
+                f"reg={reg_loss_val:.4f} "
                 f"phase={phase} "
                 f"A={pct_a:.2%} B={pct_b:.2%} C={pct_c:.2%} "
                 f"ent={mean_ent:.3f} "

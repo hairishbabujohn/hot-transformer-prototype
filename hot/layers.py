@@ -196,7 +196,7 @@ class HoTLayer(nn.Module):
         path_c_out, _ = self.path_c_attn(x_norm, x_norm, x_norm)
 
         path_out = w_a * path_a_out + w_b * path_b_out + w_c * path_c_out
-        weights = torch.stack([w_a.detach(), w_b.detach(), w_c.detach()])
+        weights = torch.stack([w_a, w_b, w_c])
         return path_out, weights
 
     def _hard_route(
