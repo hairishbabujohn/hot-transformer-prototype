@@ -31,7 +31,28 @@ training:
 czu:
   warmup_steps: 1000          # force Path C for first 1000 steps, collect entropy stats
   update_every: 500           # EMA threshold update interval (steps)
-  ema_beta: 0.95              # EMA decay for threshold updates
+  ema_beta: 0.95              # EMA decay for threshold updates (higher = slower drift)
+  # Hard bounds that prevent thresholds from saturating near 0 or 1
+  # regardless of the warmup entropy distribution.
+  h_low_clamp_min: 0.2        # H_low will never drop below this
+  h_low_clamp_max: 0.75       # H_low will never exceed this
+  h_high_clamp_min: 0.35      # H_high will never drop below this
+  h_high_clamp_max: 0.90      # H_high will never exceed this (key: keeps H_high < 1)
+  # Gradual schedule: over this many post-warmup steps the thresholds are
+  # linearly interpolated from their initial values toward the learned values,
+  # avoiding a sudden jump that would otherwise destabilise routing.
+  schedule_steps: 2000
+
+routing_reg:
+  # Load-balancing loss: KL divergence of mean routing weights to target_dist.
+  # Prevents collapse to always-C and encourages use of all three paths.
+  lambda_balance: 0.05
+  # Compute-cost penalty: directly penalises Path C (O(N²) attention) usage.
+  lambda_compute: 0.02
+  # Target routing distribution [frac_A, frac_B, frac_C].
+  # The default asks for roughly equal use of all three paths.
+  # Increase frac_A/frac_B (and decrease frac_C) to push for more compute savings.
+  target_dist: [0.33, 0.34, 0.33]
 
 logging:
   log_every: 100

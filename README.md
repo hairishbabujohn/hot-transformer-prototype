@@ -68,15 +68,41 @@ The CZU is a stateful object that manages per-layer thresholds across training:
 1. **Warmup** (first W steps, default 1000): forces all layers to use **Path C**
    and collects entropy statistics.
 2. **Initialization**: after warmup, sets H_low = P10 and H_high = P90 of the
-   warmup entropy distribution for each layer.
-3. **Running**: every K steps (default 500) updates thresholds via EMA:
+   warmup entropy distribution for each layer, then **clamps** both values to the
+   configured hard bounds (`h_low_clamp`, `h_high_clamp`).  This prevents
+   thresholds from saturating near 1.0 even when the warmup entropy distribution
+   is narrow.
+3. **Schedule** (next `schedule_steps` steps, default 2000): instead of jumping
+   instantly to the learned thresholds, `get_all_thresholds()` returns a linear
+   interpolation from the initial values toward the clamped learned values.  This
+   gives the model time to adapt paths B and A before facing a hard routing
+   decision.
+4. **Running**: every K steps (default 500) updates thresholds via EMA:
 
        H_low  ← β · H_low  + (1−β) · P10(recent entropies)
        H_high ← β · H_high + (1−β) · P90(recent entropies)
 
+   After each EMA step the hard bounds are re-applied.
+
 ---
 
-## Repository Structure
+#### Routing Regularization
+
+Two optional loss terms are added on top of the task loss **after the warmup
+phase** to prevent routing collapse and encourage efficient computation:
+
+| Term | Formula | Effect |
+|------|---------|--------|
+| **Balance loss** (`lambda_balance`) | KL(target_dist \|\| avg_route_weights) | Pulls the mean routing distribution toward the configured `target_dist`, preventing degenerate collapse to always-C. |
+| **Compute-cost penalty** (`lambda_compute`) | mean(w_C across layers) | Directly penalises Path-C usage, incentivising the model to produce lower-entropy representations that route to cheaper paths. |
+
+Both terms flow gradients back through the soft-routing weights all the way to
+the model's representations, giving the model a direct signal to adjust its
+entropy profile.
+
+---
+
+
 
 ```
 hot/                 # Core package
@@ -169,22 +195,53 @@ step=100/10000 loss=0.6883 phase=warmup A=0.00% B=0.00% C=100.00% ...
 
 ## Config Reference
 
-| Key                         | Default | Description                                    |
-|-----------------------------|---------|------------------------------------------------|
-| `model.d_model`             | 64      | Hidden dimension                               |
-| `model.n_layers`            | 4       | Number of HoT layers                          |
-| `model.n_heads`             | 4       | Attention heads (Path C)                       |
-| `model.conv_kernel_size`    | 7       | Convolution kernel size (Path B)               |
-| `model.gate_temperature`    | 0.05    | Sigmoid temperature for soft routing           |
-| `data.dataset`              | `synthetic_bracket` | Task name                        |
-| `data.seq_len`              | 64      | Sequence length                                |
-| `data.batch_size`           | 32      | Mini-batch size                                |
-| `czu.warmup_steps`          | 1000    | Steps forcing Path C during warmup             |
-| `czu.update_every`          | 500     | Steps between EMA threshold updates            |
-| `czu.ema_beta`              | 0.95    | EMA decay factor                               |
-| `training.steps`            | 10000   | Total training steps                           |
-| `training.lr`               | 0.001   | AdamW learning rate                            |
-| `training.eval_every`       | 500     | Validation interval                            |
+| Key                              | Default          | Description                                          |
+|----------------------------------|------------------|------------------------------------------------------|
+| `model.d_model`                  | 64               | Hidden dimension                                     |
+| `model.n_layers`                 | 4                | Number of HoT layers                                 |
+| `model.n_heads`                  | 4                | Attention heads (Path C)                             |
+| `model.conv_kernel_size`         | 7                | Convolution kernel size (Path B)                     |
+| `model.gate_temperature`         | 0.05             | Sigmoid temperature for soft routing                 |
+| `data.dataset`                   | `synthetic_bracket` | Task name                                         |
+| `data.seq_len`                   | 64               | Sequence length                                      |
+| `data.batch_size`                | 32               | Mini-batch size                                      |
+| `czu.warmup_steps`               | 1000             | Steps forcing Path C during warmup                   |
+| `czu.update_every`               | 500              | Steps between EMA threshold updates                  |
+| `czu.ema_beta`                   | 0.95             | EMA decay factor                                     |
+| `czu.h_low_clamp_min`            | 0.2              | Hard lower bound for H_low                           |
+| `czu.h_low_clamp_max`            | 0.75             | Hard upper bound for H_low                           |
+| `czu.h_high_clamp_min`           | 0.35             | Hard lower bound for H_high                          |
+| `czu.h_high_clamp_max`           | 0.90             | Hard upper bound for H_high (key knob: keep < 1)     |
+| `czu.schedule_steps`             | 2000             | Post-warmup steps for gradual threshold transition   |
+| `routing_reg.lambda_balance`     | 0.05             | Weight for routing load-balancing KL loss            |
+| `routing_reg.lambda_compute`     | 0.02             | Weight for Path-C compute-cost penalty               |
+| `routing_reg.target_dist`        | [0.33, 0.34, 0.33] | Target routing distribution [A, B, C]             |
+| `training.steps`                 | 10000            | Total training steps                                 |
+| `training.lr`                    | 0.001            | AdamW learning rate                                  |
+| `training.eval_every`            | 500              | Validation interval                                  |
+
+### Tuning Guide
+
+**If routing still collapses to all-C after warmup:**
+- Decrease `czu.h_high_clamp_max` (e.g. 0.85) so H_high stays below the typical
+  entropy value, forcing the model to reduce entropy to escape Path C.
+- Increase `routing_reg.lambda_compute` (e.g. 0.05) to strengthen the penalty.
+- Increase `routing_reg.lambda_balance` (e.g. 0.1) to push harder toward the
+  target distribution.
+
+**If val_acc drops too much after warmup:**
+- Decrease `routing_reg.lambda_balance` / `lambda_compute` (e.g. halve them).
+- Increase `czu.schedule_steps` (e.g. 3000) for a gentler threshold transition.
+- Adjust `routing_reg.target_dist` to allow more Path-C usage (e.g.
+  `[0.1, 0.3, 0.6]`).
+
+**Expected successful behaviour (synthetic_tiny):**
+- During warmup (steps 1–1000): A=0% B=0% C=100%, val_acc rising to ~0.95.
+- After warmup (steps 1001–3000, schedule active): gradual mix of paths appears;
+  all three paths should each account for > 5% of layer decisions on average.
+- After schedule (steps 3000+): stable routing mix, val_acc within ~1–2% of the
+  C-only warmup baseline (≥ 0.94).
+- Thresholds should stay in the range [0.2, 0.90] and not saturate at ~1.0.
 
 ---
 
