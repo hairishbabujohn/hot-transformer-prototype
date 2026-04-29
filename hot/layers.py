@@ -247,7 +247,7 @@ class HoTLayer(nn.Module):
         x_next = x + self.alpha * path_out
 
         if not return_diagnostics:
-            return x_next, difficulty.mean(), g
+            return x_next, None, g
 
         # Note: Do not detach g here, we want diagnostics/metrics to be computable
         g_mean = g.mean(dim=0).detach() # (3,)
@@ -295,4 +295,4 @@ class HoTLayer(nn.Module):
                 "gate_entropy": gate_entropy.detach(),
             }
 
-        return x_next, oem_val.mean(), g, diagnostics
+        return x_next, None, g, diagnostics

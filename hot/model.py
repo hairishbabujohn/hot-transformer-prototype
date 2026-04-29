@@ -86,7 +86,6 @@ class HoTEncoder(nn.Module):
 
         Returns:
             logits:    (B, n_classes) classification logits.
-            oem_vals:  List of scalar OEM tensors, one per layer.
             routes:    List of soft routing weights per layer (B, 3).
             diagnostics: Optional list of per-layer diagnostics dicts.
         """
@@ -96,24 +95,22 @@ class HoTEncoder(nn.Module):
         pos = torch.arange(N, device=device).unsqueeze(0).expand(B, -1)
         h = self.emb_drop(self.tok_emb(x) + self.pos_emb(pos))
 
-        oem_vals = []
         routes = []
         diagnostics = []
 
         for layer in self.layers:
             if return_diagnostics:
-                h, oem_val, route_info, diag = layer(
+                h, _, route_info, diag = layer(
                     h, tau=tau, force_c=force_c, return_diagnostics=True,
                 )
                 diagnostics.append(diag)
             else:
-                h, oem_val, route_info = layer(h, tau=tau, force_c=force_c)
-            oem_vals.append(oem_val)
+                h, _, route_info = layer(h, tau=tau, force_c=force_c)
             routes.append(route_info)
 
         # Mean pooling over sequence dimension
         pooled = self.norm_out(h).mean(dim=1)   # (B, D)
         logits = self.classifier(pooled)
         if return_diagnostics:
-            return logits, oem_vals, routes, diagnostics
-        return logits, oem_vals, routes
+            return logits, routes, diagnostics
+        return logits, routes

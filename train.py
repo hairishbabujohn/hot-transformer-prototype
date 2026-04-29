@@ -86,11 +86,11 @@ def evaluate(
         
         # tau=1.0 for evaluation
         if return_metrics:
-            logits, _, routes, diagnostics = model(
+            logits, routes, diagnostics = model(
                 x, tau=1.0, force_c=force_c, return_diagnostics=True,
             )
         else:
-            logits, _, routes = model(x, tau=1.0, force_c=force_c)
+            logits, routes = model(x, tau=1.0, force_c=force_c)
             
         preds = logits.argmax(dim=-1)
         correct += (preds == y).sum().item()
@@ -426,7 +426,7 @@ def train_loop(
         else:
             force_c = True
         
-        logits, oem_vals, routes = model(x, tau=tau, force_c=force_c)
+        logits, routes = model(x, tau=tau, force_c=force_c)
         loss_task = criterion(logits, y)
 
         if not force_c and len(routes) > 0:
@@ -487,7 +487,7 @@ def train_loop(
             else:
                 pct_a, pct_b, pct_c = 0.0, 0.0, 0.0
                 
-            mean_ent = sum(v.mean().item() for v in oem_vals) / len(oem_vals) if oem_vals else 0.0
+            mean_ent = 0.0
             elapsed = time.time() - t0
             
             alpha_str = " ".join(f"L{i}:{layer.alpha.item():.2f}" for i, layer in enumerate(model.layers))
