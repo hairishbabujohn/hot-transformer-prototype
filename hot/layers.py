@@ -160,6 +160,25 @@ class HoTLayer(nn.Module):
     # Internal routing helpers
     # ------------------------------------------------------------------
 
+    def _soft_gate_weights(
+        self,
+        h: torch.Tensor,
+        H_low: float,
+        H_high: float,
+    ) -> tuple:
+        """Compute soft routing weights from OEM value."""
+        temp = self.gate_temperature
+        H_low_t = torch.as_tensor(H_low, dtype=h.dtype, device=h.device)
+        H_high_t = torch.as_tensor(H_high, dtype=h.dtype, device=h.device)
+
+        w_a = torch.sigmoid((H_low_t - h) / temp)
+        w_c = torch.sigmoid((h - H_high_t) / temp)
+        w_b = (1.0 - w_a - w_c).clamp(min=0.0)
+
+        total = w_a + w_b + w_c
+        w_a, w_b, w_c = w_a / total, w_b / total, w_c / total
+        return w_a, w_b, w_c
+
     def _soft_route(
         self,
         x_norm: torch.Tensor,
@@ -177,18 +196,7 @@ class HoTLayer(nn.Module):
             path_out: (B, N, D) blended path output.
             weights:  1-D Tensor [w_A, w_B, w_C] for logging.
         """
-        temp = self.gate_temperature
-        H_low_t = torch.as_tensor(H_low, dtype=h.dtype, device=h.device)
-        H_high_t = torch.as_tensor(H_high, dtype=h.dtype, device=h.device)
-
-        # Soft gates derived from the entropy scalar
-        w_a = torch.sigmoid((H_low_t - h) / temp)    # peaks when h << H_low
-        w_c = torch.sigmoid((h - H_high_t) / temp)   # peaks when h >> H_high
-        w_b = (1.0 - w_a - w_c).clamp(min=0.0)
-
-        # Normalize so weights sum to 1
-        total = w_a + w_b + w_c
-        w_a, w_b, w_c = w_a / total, w_b / total, w_c / total
+        w_a, w_b, w_c = self._soft_gate_weights(h, H_low, H_high)
 
         # Compute all paths (required so gradients flow through all branches)
         path_a_out = torch.zeros_like(x_norm)
@@ -230,6 +238,7 @@ class HoTLayer(nn.Module):
         H_low: float,
         H_high: float,
         force_c: bool = False,
+        return_diagnostics: bool = False,
     ) -> tuple:
         """Run one HoT layer.
 
@@ -244,6 +253,7 @@ class HoTLayer(nn.Module):
             oem_val:    Scalar entropy tensor (for CZU update).
             route_info: During training (soft) – Tensor [w_A, w_B, w_C].
                         During eval / force_c – Integer path index (0/1/2).
+            diagnostics: Optional dict of eval-only diagnostics when requested.
         """
         # --- Pre-norm ---
         x_norm = self.norm_pre(x)
@@ -264,4 +274,59 @@ class HoTLayer(nn.Module):
 
         # --- Pathway Merger: x_next = LN(x + alpha * path_output) ---
         x_next = self.norm_merge(x + self.alpha * path_out)
-        return x_next, oem_val, route_info
+
+        if not return_diagnostics:
+            return x_next, oem_val, route_info
+
+        with torch.no_grad():
+            g_a, g_b, g_c = self._soft_gate_weights(oem_val, H_low, H_high)
+            g = torch.stack([g_a, g_b, g_c]).detach()
+
+            path_a_out = torch.zeros_like(x_norm)
+            path_b_out = self.path_b(x_norm)
+            path_c_out, _ = self.path_c_attn(x_norm, x_norm, x_norm)
+
+            y_full = x + self.alpha * (g_a * path_a_out + g_b * path_b_out + g_c * path_c_out)
+            y_no_a = x + self.alpha * (g_b * path_b_out + g_c * path_c_out)
+            y_no_b = x + self.alpha * (g_a * path_a_out + g_c * path_c_out)
+            y_no_c = x + self.alpha * (g_a * path_a_out + g_b * path_b_out)
+
+            def mean_norm(t: torch.Tensor) -> torch.Tensor:
+                return torch.linalg.norm(t, dim=(1, 2)).mean()
+
+            a_impact = mean_norm(y_full - y_no_a)
+            b_impact = mean_norm(y_full - y_no_b)
+            c_impact = mean_norm(y_full - y_no_c)
+            x_norm_mag = mean_norm(x)
+
+            denom = x_norm_mag + 1e-9
+            a_ratio = a_impact / denom
+            b_ratio = b_impact / denom
+            c_ratio = c_impact / (a_impact + b_impact + c_impact + 1e-9)
+
+            gate_entropy = -(g * (g + 1e-9).log()).sum(dim=0)
+            if gate_entropy.ndim > 0:
+                gate_entropy = gate_entropy.mean()
+
+            diagnostics = {
+                "x_block_in": x.detach(),
+                "alpha": self.alpha.detach(),
+                "g": g,
+                "A": path_a_out.detach(),
+                "B": path_b_out.detach(),
+                "C": path_c_out.detach(),
+                "y_full": y_full.detach(),
+                "y_noA": y_no_a.detach(),
+                "y_noB": y_no_b.detach(),
+                "y_noC": y_no_c.detach(),
+                "A_impact": a_impact.detach(),
+                "B_impact": b_impact.detach(),
+                "C_impact": c_impact.detach(),
+                "x_norm_mag": x_norm_mag.detach(),
+                "A_ratio": a_ratio.detach(),
+                "B_ratio": b_ratio.detach(),
+                "C_ratio": c_ratio.detach(),
+                "gate_entropy": gate_entropy.detach(),
+            }
+
+        return x_next, oem_val, route_info, diagnostics
