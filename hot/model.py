@@ -70,18 +70,36 @@ class HoTEncoder(nn.Module):
         nn.init.normal_(self.classifier.weight, std=0.02)
         nn.init.zeros_(self.classifier.bias)
 
+    def forward_c_only(self, x: torch.Tensor) -> torch.Tensor:
+        """Fast path to compute logits using only C-path (no routing)."""
+        B = x.shape[0]
+        dummy_difficulty = torch.zeros(B, device=x.device)
+        logits, _ = self.forward(x, difficulty=dummy_difficulty, force_c=True)
+        return logits
+
+    def forward_noC(self, x: torch.Tensor) -> torch.Tensor:
+        """Fast path to compute logits using only A and B paths (no C-path, no routing)."""
+        B = x.shape[0]
+        dummy_difficulty = torch.zeros(B, device=x.device)
+        logits, _ = self.forward(x, difficulty=dummy_difficulty, force_no_c=True)
+        return logits
+
     def forward(
         self,
         x: torch.Tensor,
+        difficulty: torch.Tensor,
         tau: float = 1.0,
         force_c: bool = False,
+        force_no_c: bool = False,
         return_diagnostics: bool = False,
     ) -> tuple:
         """Run the encoder and return classification logits.
 
         Args:
             x:          Token ID tensor of shape (B, N).
+            difficulty: Per-sample difficulty tensor of shape (B,).
             tau:        Temperature for soft routing.
+            force_c:    If True, bypasses routing and uses only C-path.
             return_diagnostics: If True, return per-layer diagnostics.
 
         Returns:
@@ -101,11 +119,11 @@ class HoTEncoder(nn.Module):
         for layer in self.layers:
             if return_diagnostics:
                 h, _, route_info, diag = layer(
-                    h, tau=tau, force_c=force_c, return_diagnostics=True,
+                    h, difficulty=difficulty, tau=tau, force_c=force_c, force_no_c=force_no_c, return_diagnostics=True,
                 )
                 diagnostics.append(diag)
             else:
-                h, _, route_info = layer(h, tau=tau, force_c=force_c)
+                h, _, route_info = layer(h, difficulty=difficulty, tau=tau, force_c=force_c, force_no_c=force_no_c)
             routes.append(route_info)
 
         # Mean pooling over sequence dimension

@@ -16,29 +16,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# ---------------------------------------------------------------------------
-# Token Entropy Variance (Difficulty Proxy)
-# ---------------------------------------------------------------------------
-
-def compute_token_entropy_variance(x: torch.Tensor) -> torch.Tensor:
-    """Compute variance of token-level Shannon entropy over the sequence.
-
-    Args:
-        x: Tensor of shape (B, N, D).
-
-    Returns:
-        Tensor of shape (B,) -- entropy variance.
-    """
-    # Softmax over channel dimension to treat it as a distribution
-    p = F.softmax(x, dim=-1)
-    
-    # Token-level entropy
-    token_entropy = -(p * torch.log(p + 1e-9)).sum(dim=-1)  # (B, N)
-    
-    # Variance across sequence dimension
-    difficulty = token_entropy.var(dim=1, unbiased=False)   # (B,)
-    return difficulty
-
 
 # ---------------------------------------------------------------------------
 # Path B: Depthwise-Separable 1-D Convolution
@@ -116,14 +93,14 @@ class TrainableGate(nn.Module):
         x_mean = x.mean(dim=(1, 2))  # (B,)
         x_var = x.var(dim=(1, 2), unbiased=False)  # (B,)
         
+        # Sequence norm
+        x_norm = torch.linalg.norm(x.reshape(B, -1), dim=-1) # (B,)
+        
         # Temporal difference
         x_diff = x[:, 1:, :] - x[:, :-1, :]
-        t_diff = torch.linalg.norm(x_diff.reshape(B, -1), dim=-1) # (B,)
+        t_diff = x_diff.pow(2).mean(dim=(1, 2)) # (B,)
         
-        # Channel variance
-        channel_var = x.var(dim=2, unbiased=False).mean(dim=1) # (B,)
-        
-        features = torch.stack([x_mean, x_var, t_diff, channel_var, difficulty], dim=-1) # (B, 5)
+        features = torch.stack([x_mean, x_var, x_norm, t_diff, difficulty], dim=-1) # (B, 5)
         features = self.norm(features)
         
         logits = self.mlp(features) # (B, 3)
@@ -196,19 +173,21 @@ class HoTLayer(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
+        difficulty: torch.Tensor,
         tau: float = 1.0,
         force_c: bool = False,
+        force_no_c: bool = False,
         return_diagnostics: bool = False,
     ) -> tuple:
         """Run one HoT layer.
 
         Args:
-            x:       Input tensor (B, N, D).
-            tau:     Temperature for softmax gate.
+            x:          Input tensor (B, N, D).
+            difficulty: Per-sample difficulty tensor (B,).
+            tau:        Temperature for softmax gate.
 
         Returns:
             x_next:     Output tensor (B, N, D).
-            difficulty: Scalar entropy variance tensor.
             route_info: Tensor [B, 3] of soft gate weights.
             diagnostics: Optional dict of diagnostics.
         """
@@ -216,13 +195,12 @@ class HoTLayer(nn.Module):
         # --- Pre-norm ---
         x_norm = self.norm_pre(x)
 
-        # --- Token Entropy Variance (Difficulty) ---
-        difficulty = compute_token_entropy_variance(x_norm) # (B,)
-
         # --- Homeostatic Gate ---
         gate_logits = self.gate(x_norm, difficulty) # (B, 3)
         if force_c:
             g = torch.tensor([0.0, 0.0, 1.0], device=x.device, dtype=x.dtype).unsqueeze(0).expand(B, -1)
+        elif force_no_c:
+            g = torch.tensor([0.5, 0.5, 0.0], device=x.device, dtype=x.dtype).unsqueeze(0).expand(B, -1)
         else:
             g = torch.softmax(gate_logits / tau, dim=-1) # (B, 3)
             g = g.clamp(min=1e-6)

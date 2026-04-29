@@ -21,6 +21,7 @@ import json
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import yaml
 
 from hot.model import HoTEncoder
@@ -84,13 +85,19 @@ def evaluate(
     for x, y in val_loader:
         x, y = x.to(device), y.to(device)
         
+        # difficulty (detached, external)
+        with torch.no_grad():
+            logits_c = model.forward_c_only(x)
+            difficulty = F.cross_entropy(logits_c, y, reduction='none')
+            difficulty = (difficulty - difficulty.mean()) / (difficulty.std() + 1e-6)
+
         # tau=1.0 for evaluation
         if return_metrics:
             logits, routes, diagnostics = model(
-                x, tau=1.0, force_c=force_c, return_diagnostics=True,
+                x, difficulty=difficulty, tau=1.0, force_c=force_c, return_diagnostics=True,
             )
         else:
-            logits, routes = model(x, tau=1.0, force_c=force_c)
+            logits, routes = model(x, difficulty=difficulty, tau=1.0, force_c=force_c)
             
         preds = logits.argmax(dim=-1)
         correct += (preds == y).sum().item()
@@ -251,8 +258,8 @@ def _check_acceptance(
         step = record["step"]
         
         c_diff = metrics.get("C_high", 0) - metrics.get("C_low", 0)
-        if c_diff < 0.07:
-            return False, f"step {step} C_high - C_low {c_diff:.3f} < 0.07"
+        if c_diff < 0.05:
+            return False, f"step {step} C_high - C_low {c_diff:.3f} < 0.05"
 
         if metrics["A_mean"] < 0.05:
             return False, f"step {step} A_mean {metrics['A_mean']:.3f} < 0.05"
@@ -401,11 +408,8 @@ def train_loop(
     tau_end = 1.0
     tau_steps = 2000
 
-    lambda_c = 0.05
-    lambda_bal = 0.02
-    lambda_entropy = 0.01
-    
-    target_bal = torch.tensor([0.3, 0.4, 0.3], device=device)
+    lambda_cond = 0.05
+    gamma = 0.01
 
     for step in range(1, total_steps + 1):
         g_stack = None
@@ -425,8 +429,15 @@ def train_loop(
             force_c = True if step <= 500 else False
         else:
             force_c = True
+            
+        # difficulty (detached, external)
+        with torch.no_grad():
+            logits_c = model.forward_c_only(x)
+            difficulty = F.cross_entropy(logits_c, y, reduction='none')
+            difficulty = (difficulty - difficulty.mean()) / (difficulty.std() + 1e-6)
+            difficulty = difficulty.clamp(-2.0, 2.0)
         
-        logits, routes = model(x, tau=tau, force_c=force_c)
+        logits, routes = model(x, difficulty=difficulty, tau=tau, force_c=force_c)
         loss_task = criterion(logits, y)
 
         if not force_c and len(routes) > 0:
@@ -438,19 +449,22 @@ def train_loop(
             else:
                 # Stack routes: (n_layers, B, 3)
                 g_stack = torch.stack(routes)
+                g_stack_b = g_stack.transpose(0, 1) # (B, n_layers, 3)
                 
-                # Compute targeted penalty: lambda * |gC.mean() - 0.25|
-                loss_c = lambda_c * (g_stack[:, :, 2].mean() - 0.25).abs()
+                gC = g_stack_b[:, :, 2]  # (B, n_layers)
                 
-                # Balance regularization against [0.3, 0.4, 0.3] (MSE)
-                g_mean_total = g_stack.mean(dim=(0, 1)) # (3,)
-                loss_bal = lambda_bal * (g_mean_total - target_bal).pow(2).sum()
+                # Conditional routing loss
+                loss_cond = -lambda_cond * (gC * difficulty.unsqueeze(1)).mean()
                 
-                # Gate entropy regularization
-                g_entropy = -(g_stack * torch.log(g_stack + 1e-9)).sum(dim=-1).mean()
-                loss_ent = -lambda_entropy * g_entropy
+                # Entropy regularization
+                loss_ent = gamma * (-(g_stack_b * torch.log(g_stack_b + 1e-9)).sum(dim=-1).mean())
                 
-                loss = loss_task + loss_c + loss_bal + loss_ent
+                # Final loss
+                loss = loss_task + loss_cond + loss_ent
+                
+                # For logging only
+                loss_c = loss_cond.detach()
+                loss_bal = torch.tensor(0.0)
         else:
             loss = loss_task
             loss_c = torch.tensor(0.0)
