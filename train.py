@@ -408,9 +408,6 @@ def train_loop(
     tau_end = 1.0
     tau_steps = 2000
 
-    lambda_cond = 0.05
-    gamma = 0.01
-
     for step in range(1, total_steps + 1):
         g_stack = None
         # ---- Fetch batch ----
@@ -444,7 +441,6 @@ def train_loop(
             if step <= 2000:
                 loss = loss_task
                 loss_c = torch.tensor(0.0)
-                loss_bal = torch.tensor(0.0)
                 loss_ent = torch.tensor(0.0)
             else:
                 # Stack routes: (n_layers, B, 3)
@@ -454,21 +450,19 @@ def train_loop(
                 gC = g_stack_b[:, :, 2]  # (B, n_layers)
                 
                 # Conditional routing loss
-                loss_cond = -lambda_cond * (gC * difficulty.unsqueeze(1)).mean()
+                loss_cond = -0.05 * (gC * difficulty.unsqueeze(1)).mean()
                 
                 # Entropy regularization
-                loss_ent = gamma * (-(g_stack_b * torch.log(g_stack_b + 1e-9)).sum(dim=-1).mean())
+                loss_ent = 0.01 * (-(g_stack_b * torch.log(g_stack_b + 1e-9)).sum(dim=-1).mean())
                 
                 # Final loss
                 loss = loss_task + loss_cond + loss_ent
                 
                 # For logging only
                 loss_c = loss_cond.detach()
-                loss_bal = torch.tensor(0.0)
         else:
             loss = loss_task
             loss_c = torch.tensor(0.0)
-            loss_bal = torch.tensor(0.0)
             loss_ent = torch.tensor(0.0)
 
         assert not torch.isnan(loss), "Loss is NaN"
@@ -510,7 +504,7 @@ def train_loop(
             if force_c_only or step <= 2000:
                 loss_str = f"loss={loss.item():.4f}"
             else:
-                loss_str = f"task={loss_task.item():.4f} c={loss_c.item():.4f} bal={loss_bal.item():.4f} ent={loss_ent.item():.4f} tot={loss.item():.4f}"
+                loss_str = f"task={loss_task.item():.4f} cond={loss_c.item():.4f} ent={loss_ent.item():.4f} tot={loss.item():.4f}"
 
             print(
                 f"[train:{run_label}] step={step}/{total_steps} {loss_str} "
@@ -526,8 +520,15 @@ def train_loop(
                 val_acc, pct_a, pct_b, pct_c, metrics = evaluate(
                     model, val_loader, device, return_metrics=True, force_c=force_c_only,
                 )
-                c_diff = metrics.get("C_high", 0) - metrics.get("C_low", 0)
-                eval_str = f"  [eval:{run_label}] step={step} val_acc={val_acc:.4f} routing A={pct_a:.1%} B={pct_b:.1%} C={pct_c:.1%} (C_high-C_low={c_diff:.3f})"
+                c_high = metrics.get("C_high", 0)
+                c_low = metrics.get("C_low", 0)
+                c_diff = c_high - c_low
+                gate_entropy = metrics.get("gate_entropy_mean", 0)
+                eval_str = (
+                    f"  [eval:{run_label}] step={step} val_acc={val_acc:.4f}\n"
+                    f"      routing A={pct_a:.1%} B={pct_b:.1%} C={pct_c:.1%} | entropy={gate_entropy:.3f}\n"
+                    f"      conditional C_high={c_high:.3f} C_low={c_low:.3f} gap={c_diff:.3f}"
+                )
             else:
                 val_acc, pct_a, pct_b, pct_c = evaluate(
                     model, val_loader, device, return_metrics=False, force_c=force_c_only,
