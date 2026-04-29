@@ -89,7 +89,8 @@ def evaluate(
         with torch.no_grad():
             logits_c = model.forward_c_only(x)
             difficulty = F.cross_entropy(logits_c, y, reduction='none')
-            difficulty = (difficulty - difficulty.mean()) / (difficulty.std() + 1e-6)
+            difficulty = torch.clamp(difficulty.detach(), 0.0, 2.0)
+            difficulty = difficulty / (difficulty.mean() + 1e-6)
 
         # tau=1.0 for evaluation
         if return_metrics:
@@ -265,8 +266,10 @@ def _check_acceptance(
             return False, f"step {step} A_mean {metrics['A_mean']:.3f} < 0.05"
         if metrics["B_mean"] < 0.05:
             return False, f"step {step} B_mean {metrics['B_mean']:.3f} < 0.05"
-        if metrics["C_mean"] > 0.90:
-            return False, f"step {step} C_mean {metrics['C_mean']:.3f} > 0.90"
+        if metrics["C_mean"] < 0.15:
+            return False, f"step {step} C_mean {metrics['C_mean']:.3f} < 0.15"
+        if metrics.get("gate_entropy_mean", 1.0) < 0.3:
+            return False, f"step {step} gate_entropy {metrics.get('gate_entropy_mean', 1.0):.3f} < 0.3"
 
         g_layer = metrics["g_layer_mean"]
         a_vals = [layer[0] for layer in g_layer]
@@ -431,8 +434,8 @@ def train_loop(
         with torch.no_grad():
             logits_c = model.forward_c_only(x)
             difficulty = F.cross_entropy(logits_c, y, reduction='none')
-            difficulty = (difficulty - difficulty.mean()) / (difficulty.std() + 1e-6)
-            difficulty = difficulty.clamp(-2.0, 2.0)
+            difficulty = torch.clamp(difficulty.detach(), 0.0, 2.0)
+            difficulty = difficulty / (difficulty.mean() + 1e-6)
         
         logits, routes = model(x, difficulty=difficulty, tau=tau, force_c=force_c)
         loss_task = criterion(logits, y)
@@ -441,6 +444,7 @@ def train_loop(
             if step <= 2000:
                 loss = loss_task
                 loss_c = torch.tensor(0.0)
+                loss_anc = torch.tensor(0.0)
                 loss_ent = torch.tensor(0.0)
             else:
                 # Stack routes: (n_layers, B, 3)
@@ -450,19 +454,25 @@ def train_loop(
                 gC = g_stack_b[:, :, 2]  # (B, n_layers)
                 
                 # Conditional routing loss
-                loss_cond = -0.05 * (gC * difficulty.unsqueeze(1)).mean()
+                weights = difficulty / (difficulty.mean() + 1e-6)
+                loss_cond = -0.2 * (gC * weights.unsqueeze(1)).mean()
+                
+                # Anchor loss
+                loss_anchor = 0.02 * torch.relu(0.15 - gC.mean())
                 
                 # Entropy regularization
                 loss_ent = 0.01 * (-(g_stack_b * torch.log(g_stack_b + 1e-9)).sum(dim=-1).mean())
                 
                 # Final loss
-                loss = loss_task + loss_cond + loss_ent
+                loss = loss_task + loss_cond + loss_anchor + loss_ent
                 
                 # For logging only
                 loss_c = loss_cond.detach()
+                loss_anc = loss_anchor.detach()
         else:
             loss = loss_task
             loss_c = torch.tensor(0.0)
+            loss_anc = torch.tensor(0.0)
             loss_ent = torch.tensor(0.0)
 
         assert not torch.isnan(loss), "Loss is NaN"
@@ -504,7 +514,7 @@ def train_loop(
             if force_c_only or step <= 2000:
                 loss_str = f"loss={loss.item():.4f}"
             else:
-                loss_str = f"task={loss_task.item():.4f} cond={loss_c.item():.4f} ent={loss_ent.item():.4f} tot={loss.item():.4f}"
+                loss_str = f"task={loss_task.item():.4f} cond={loss_c.item():.4f} anc={loss_anc.item():.4f} ent={loss_ent.item():.4f} tot={loss.item():.4f}"
 
             print(
                 f"[train:{run_label}] step={step}/{total_steps} {loss_str} "

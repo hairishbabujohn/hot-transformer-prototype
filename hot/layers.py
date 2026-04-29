@@ -90,18 +90,23 @@ class TrainableGate(nn.Module):
             logits: (B, 3)
         """
         B, N, D = x.shape
-        x_mean = x.mean(dim=(1, 2))  # (B,)
-        x_var = x.var(dim=(1, 2), unbiased=False)  # (B,)
-        
-        # Sequence norm
-        x_norm = torch.linalg.norm(x.reshape(B, -1), dim=-1) # (B,)
-        
-        # Temporal difference
-        x_diff = x[:, 1:, :] - x[:, :-1, :]
-        t_diff = x_diff.pow(2).mean(dim=(1, 2)) # (B,)
-        
-        features = torch.stack([x_mean, x_var, x_norm, t_diff, difficulty], dim=-1) # (B, 5)
-        features = self.norm(features)
+        x_var = x.var(dim=(1,2), unbiased=False)
+
+        x_centered = x - x.mean(dim=-1, keepdim=True)
+        contrast = (x_centered ** 2).mean(dim=(1,2))
+
+        temporal_diff = (x[:,1:] - x[:,:-1]).abs().mean(dim=(1,2))
+
+        channel_var = x.var(dim=1, unbiased=False).mean(dim=1)
+
+        z = torch.stack([
+            x_var,
+            temporal_diff,
+            contrast,
+            channel_var,
+            difficulty
+        ], dim=-1)  # (B, 5)
+        features = self.norm(z)
         
         logits = self.mlp(features) # (B, 3)
         return logits
