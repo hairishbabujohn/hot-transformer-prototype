@@ -408,6 +408,7 @@ def train_loop(
     target_bal = torch.tensor([0.3, 0.4, 0.3], device=device)
 
     for step in range(1, total_steps + 1):
+        g_stack = None
         # ---- Fetch batch ----
         try:
             x, y = next(train_iter)
@@ -458,7 +459,8 @@ def train_loop(
 
         assert not torch.isnan(loss), "Loss is NaN"
         if not force_c_only and len(routes) > 0:
-            assert not torch.isnan(g_stack).any(), "Gate probabilities contain NaN"
+            if g_stack is not None:
+                assert not torch.isnan(g_stack).any(), "Gate probabilities contain NaN"
 
         # ---- Backward ----
         optimizer.zero_grad()
