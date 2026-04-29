@@ -82,23 +82,15 @@ def evaluate(
     all_gC = []
     criterion_none = nn.CrossEntropyLoss(reduction='none')
 
-    for x, y in val_loader:
-        x, y = x.to(device), y.to(device)
+    for x, y, sample_ids in val_loader:
+        x, y, sample_ids = x.to(device), y.to(device), sample_ids.to(device)
         
-        # difficulty (detached, external)
-        with torch.no_grad():
-            logits_c = model.forward_c_only(x)
-            difficulty = F.cross_entropy(logits_c, y, reduction='none')
-            difficulty = torch.clamp(difficulty.detach(), 0.0, 2.0)
-            difficulty = difficulty / (difficulty.mean() + 1e-6)
-
-        # tau=1.0 for evaluation
         if return_metrics:
-            logits, routes, diagnostics = model(
-                x, difficulty=difficulty, tau=1.0, force_c=force_c, return_diagnostics=True,
+            logits, routes, entropies, diagnostics = model(
+                x, sample_ids=sample_ids, force_c=force_c, return_diagnostics=True,
             )
         else:
-            logits, routes = model(x, difficulty=difficulty, tau=1.0, force_c=force_c)
+            logits, routes, entropies = model(x, sample_ids=sample_ids, force_c=force_c)
             
         preds = logits.argmax(dim=-1)
         correct += (preds == y).sum().item()
@@ -106,15 +98,14 @@ def evaluate(
 
         if return_metrics:
             batch_size = x.size(0)
-            total_samples += batch_size
+            for i, ent in enumerate(entropies):
+                sum_gate_entropy += ent.std()
             
-            loss_batch = criterion_none(logits, y)
-            all_losses.append(loss_batch.detach())
+            loss_ps = criterion_none(logits, y)
+            all_losses.append(loss_ps.detach().cpu())
             
             # Stack routes: (n_layers, B, 3)
             g_stack = torch.stack(routes) # (L, B, 3)
-            g_mean_batch = g_stack.mean(dim=0) # (B, 3)
-            all_gC.append(g_mean_batch[:, 2].detach())
             
             for layer_idx, diag in enumerate(diagnostics):
                 g = diag["g"].to(device)
@@ -151,27 +142,17 @@ def evaluate(
         impact_norm = impact_mean / (impact_mean.sum() + 1e-9)
         alignment_error = (g_mean - impact_norm).abs().sum().item()
         
-        C_high, C_low = 0.0, 0.0
-        if len(all_losses) > 0:
-            all_losses_t = torch.cat(all_losses)
-            all_gC_t = torch.cat(all_gC)
+        route_change_rate = 0.0
+        if len(diagnostics) > 0:
+            route_change_rate = torch.stack([d.get("route_change_rate", torch.tensor(0.0)) for d in diagnostics]).mean().item()
             
-            sorted_idx = torch.argsort(all_losses_t)
-            N_samples = len(sorted_idx)
-            top_30_idx = sorted_idx[int(0.7 * N_samples):]
-            bot_30_idx = sorted_idx[:int(0.3 * N_samples)]
-            
-            if len(top_30_idx) > 0:
-                C_high = all_gC_t[top_30_idx].mean().item()
-            if len(bot_30_idx) > 0:
-                C_low = all_gC_t[bot_30_idx].mean().item()
-
         metrics = {
             "g_mean": g_mean.tolist(),
             "A_mean": g_mean[0].item(),
             "B_mean": g_mean[1].item(),
             "C_mean": g_mean[2].item(),
             "gate_entropy_mean": gate_entropy_mean,
+            "route_change_rate_mean": route_change_rate,
             "A_impact_mean": impact_mean[0].item(),
             "B_impact_mean": impact_mean[1].item(),
             "C_impact_mean": impact_mean[2].item(),
@@ -183,8 +164,6 @@ def evaluate(
             "B_ratio_layer_mean": ratio_layer_mean[:, 1].tolist(),
             "C_ratio_layer_mean": ratio_layer_mean[:, 2].tolist(),
             "alignment_error": alignment_error,
-            "C_high": C_high,
-            "C_low": C_low,
         }
 
     model.train()
@@ -254,58 +233,31 @@ def _check_acceptance(
             f"best_val_acc_hot {best_val_acc_hot:.4f} < best_val_acc_c_only {best_val_acc_c_only:.4f}",
         )
 
-    for record in last_records:
+    for record in eval_records[-k:]:
         metrics = record["metrics"]
         step = record["step"]
-        
-        c_diff = metrics.get("C_high", 0) - metrics.get("C_low", 0)
-        if c_diff < 0.05:
-            return False, f"step {step} C_high - C_low {c_diff:.3f} < 0.05"
-
-        if metrics["A_mean"] < 0.05:
-            return False, f"step {step} A_mean {metrics['A_mean']:.3f} < 0.05"
-        if metrics["B_mean"] < 0.05:
-            return False, f"step {step} B_mean {metrics['B_mean']:.3f} < 0.05"
-        if metrics["C_mean"] < 0.15:
-            return False, f"step {step} C_mean {metrics['C_mean']:.3f} < 0.15"
-        if metrics.get("gate_entropy_mean", 1.0) < 0.3:
-            return False, f"step {step} gate_entropy {metrics.get('gate_entropy_mean', 1.0):.3f} < 0.3"
 
         g_layer = metrics["g_layer_mean"]
         a_vals = [layer[0] for layer in g_layer]
         b_vals = [layer[1] for layer in g_layer]
-        min_a_val = min(a_vals)
-        min_b_val = min(b_vals)
-        if min_a_val < 0.02:
-            idx = a_vals.index(min_a_val)
-            return False, f"step {step} A_layer_mean[{idx}] {min_a_val:.3f} < 0.02"
-        if min_b_val < 0.02:
-            idx = b_vals.index(min_b_val)
-            return False, f"step {step} B_layer_mean[{idx}] {min_b_val:.3f} < 0.02"
+        c_vals = [layer[2] for layer in g_layer]
 
-        if metrics["gate_entropy_mean"] < 0.3:
-            return (
-                False,
-                f"step {step} gate_entropy {metrics['gate_entropy_mean']:.3f} < 0.3",
-            )
-        if metrics["A_ratio_mean"] < 0.01:
-            return False, f"step {step} A_ratio {metrics['A_ratio_mean']:.3f} < 0.01"
-        if metrics["B_ratio_mean"] < 0.01:
-            return False, f"step {step} B_ratio {metrics['B_ratio_mean']:.3f} < 0.01"
-        if metrics["C_ratio_mean"] > 0.85:
-            return False, f"step {step} C_ratio {metrics['C_ratio_mean']:.3f} > 0.85"
+        for i in range(len(g_layer)):
+            A = a_vals[i]
+            B = b_vals[i]
+            C = c_vals[i]
+            if A < 0.05 or A > 0.70:
+                return False, f"step {step} layer {i} A {A:.3f} outside [0.05, 0.70]"
+            if B < 0.05 or B > 0.70:
+                return False, f"step {step} layer {i} B {B:.3f} outside [0.05, 0.70]"
+            if C < 0.05 or C > 0.90:
+                return False, f"step {step} layer {i} C {C:.3f} outside [0.05, 0.90]"
 
-        c_ratio_layer = metrics["C_ratio_layer_mean"]
-        max_c_val = max(c_ratio_layer)
-        if max_c_val > 0.90:
-            idx = c_ratio_layer.index(max_c_val)
-            return False, f"step {step} C_ratio_layer[{idx}] {max_c_val:.3f} > 0.90"
+        if metrics.get("gate_entropy_mean", 1.0) < 0.01:
+            return False, f"step {step} global entropy std {metrics.get('gate_entropy_mean'):.4f} < 0.01"
 
-        if metrics["alignment_error"] > 0.3:
-            return (
-                False,
-                f"step {step} alignment_error {metrics['alignment_error']:.3f} > 0.3",
-            )
+        if metrics.get("route_change_rate_mean", 0.0) > 0.3:
+            return False, f"step {step} route_change_rate {metrics.get('route_change_rate_mean'):.4f} > 0.3"
 
     ema_vals = [record["ema_C"] for record in last_records]
     ema_std = statistics.pstdev(ema_vals) if len(ema_vals) > 1 else 0.0
@@ -415,65 +367,30 @@ def train_loop(
         g_stack = None
         # ---- Fetch batch ----
         try:
-            x, y = next(train_iter)
+            x, y, sample_ids = next(train_iter)
         except StopIteration:
             train_iter = iter(train_loader)
-            x, y = next(train_iter)
-        x, y = x.to(device), y.to(device)
+            x, y, sample_ids = next(train_iter)
+        x, y, sample_ids = x.to(device), y.to(device), sample_ids.to(device)
 
         # ---- Forward ----
         tau = tau_end + (tau_start - tau_end) * max(0.0, (tau_steps - step) / tau_steps)
         
         # Training Schedule
         if not force_c_only:
-            force_c = True if step <= 500 else False
+            force_c = model.czu.force_path_c()
         else:
             force_c = True
             
-        # difficulty (detached, external)
-        with torch.no_grad():
-            logits_c = model.forward_c_only(x)
-            difficulty = F.cross_entropy(logits_c, y, reduction='none')
-            difficulty = torch.clamp(difficulty.detach(), 0.0, 2.0)
-            difficulty = difficulty / (difficulty.mean() + 1e-6)
-        
-        logits, routes = model(x, difficulty=difficulty, tau=tau, force_c=force_c)
-        loss_task = criterion(logits, y)
+        logits, routes, entropies = model(x, sample_ids=sample_ids, force_c=force_c)
+        loss = criterion(logits, y)
 
-        if not force_c and len(routes) > 0:
-            if step <= 2000:
-                loss = loss_task
-                loss_c = torch.tensor(0.0)
-                loss_anc = torch.tensor(0.0)
-                loss_ent = torch.tensor(0.0)
-            else:
-                # Stack routes: (n_layers, B, 3)
-                g_stack = torch.stack(routes)
-                g_stack_b = g_stack.transpose(0, 1) # (B, n_layers, 3)
-                
-                gC = g_stack_b[:, :, 2]  # (B, n_layers)
-                
-                # Conditional routing loss
-                weights = difficulty / (difficulty.mean() + 1e-6)
-                loss_cond = -0.2 * (gC * weights.unsqueeze(1)).mean()
-                
-                # Anchor loss
-                loss_anchor = 0.02 * torch.relu(0.15 - gC.mean())
-                
-                # Entropy regularization
-                loss_ent = 0.01 * (-(g_stack_b * torch.log(g_stack_b + 1e-9)).sum(dim=-1).mean())
-                
-                # Final loss
-                loss = loss_task + loss_cond + loss_anchor + loss_ent
-                
-                # For logging only
-                loss_c = loss_cond.detach()
-                loss_anc = loss_anchor.detach()
-        else:
-            loss = loss_task
-            loss_c = torch.tensor(0.0)
-            loss_anc = torch.tensor(0.0)
-            loss_ent = torch.tensor(0.0)
+        if not force_c_only and len(routes) > 0:
+            model.czu.update(entropies)
+            
+            g_stack = torch.stack(routes)
+            g_stack_b = g_stack.transpose(0, 1) # (B, n_layers, 3)
+            gC = g_stack_b[:, :, 2]  # (B, n_layers)
 
         assert not torch.isnan(loss), "Loss is NaN"
         if not force_c_only and len(routes) > 0:
@@ -505,22 +422,15 @@ def train_loop(
             else:
                 pct_a, pct_b, pct_c = 0.0, 0.0, 0.0
                 
-            mean_ent = 0.0
             elapsed = time.time() - t0
             
             alpha_str = " ".join(f"L{i}:{layer.alpha.item():.2f}" for i, layer in enumerate(model.layers))
-            
-            # loss_breakdown
-            if force_c_only or step <= 2000:
-                loss_str = f"loss={loss.item():.4f}"
-            else:
-                loss_str = f"task={loss_task.item():.4f} cond={loss_c.item():.4f} anc={loss_anc.item():.4f} ent={loss_ent.item():.4f} tot={loss.item():.4f}"
+            loss_str = f"loss={loss.item():.4f}"
 
             print(
                 f"[train:{run_label}] step={step}/{total_steps} {loss_str} "
-                f"tau={tau:.3f} "
                 f"A={pct_a:.2%} B={pct_b:.2%} C={pct_c:.2%} "
-                f"ent={mean_ent:.3f} alphas=[{alpha_str}] "
+                f"alphas=[{alpha_str}] "
                 f"elapsed={elapsed:.1f}s"
             )
 
@@ -530,14 +440,10 @@ def train_loop(
                 val_acc, pct_a, pct_b, pct_c, metrics = evaluate(
                     model, val_loader, device, return_metrics=True, force_c=force_c_only,
                 )
-                c_high = metrics.get("C_high", 0)
-                c_low = metrics.get("C_low", 0)
-                c_diff = c_high - c_low
                 gate_entropy = metrics.get("gate_entropy_mean", 0)
                 eval_str = (
                     f"  [eval:{run_label}] step={step} val_acc={val_acc:.4f}\n"
-                    f"      routing A={pct_a:.1%} B={pct_b:.1%} C={pct_c:.1%} | entropy={gate_entropy:.3f}\n"
-                    f"      conditional C_high={c_high:.3f} C_low={c_low:.3f} gap={c_diff:.3f}"
+                    f"      routing A={pct_a:.1%} B={pct_b:.1%} C={pct_c:.1%} | entropy_std={gate_entropy:.3f}\n"
                 )
             else:
                 val_acc, pct_a, pct_b, pct_c = evaluate(

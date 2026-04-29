@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 
 from .layers import HoTLayer
+from .czu import CZU
 
 
 class HoTEncoder(nn.Module):
@@ -41,7 +42,7 @@ class HoTEncoder(nn.Module):
         max_seq_len: int,
         conv_kernel_size: int = 7,
         dropout: float = 0.1,
-        gate_temperature: float = 0.05,
+        dataset_size: int = 100000,
     ) -> None:
         super().__init__()
         self.d_model = d_model
@@ -57,6 +58,12 @@ class HoTEncoder(nn.Module):
             HoTLayer(d_model, n_heads, conv_kernel_size, dropout)
             for _ in range(n_layers)
         ])
+        
+        self.czu = CZU(n_layers, warmup_steps=500)
+        self.route_memory = {
+            i: torch.full((dataset_size,), 2, dtype=torch.long)
+            for i in range(n_layers)
+        }
 
         # Output head
         self.norm_out = nn.LayerNorm(d_model)
@@ -70,65 +77,64 @@ class HoTEncoder(nn.Module):
         nn.init.normal_(self.classifier.weight, std=0.02)
         nn.init.zeros_(self.classifier.bias)
 
-    def forward_c_only(self, x: torch.Tensor) -> torch.Tensor:
-        """Fast path to compute logits using only C-path (no routing)."""
-        B = x.shape[0]
-        dummy_difficulty = torch.zeros(B, device=x.device)
-        logits, _ = self.forward(x, difficulty=dummy_difficulty, force_c=True)
-        return logits
-
-    def forward_noC(self, x: torch.Tensor) -> torch.Tensor:
-        """Fast path to compute logits using only A and B paths (no C-path, no routing)."""
-        B = x.shape[0]
-        dummy_difficulty = torch.zeros(B, device=x.device)
-        logits, _ = self.forward(x, difficulty=dummy_difficulty, force_no_c=True)
-        return logits
-
     def forward(
         self,
         x: torch.Tensor,
-        difficulty: torch.Tensor,
-        tau: float = 1.0,
+        sample_ids: torch.Tensor,
         force_c: bool = False,
-        force_no_c: bool = False,
         return_diagnostics: bool = False,
     ) -> tuple:
         """Run the encoder and return classification logits.
 
         Args:
             x:          Token ID tensor of shape (B, N).
-            difficulty: Per-sample difficulty tensor of shape (B,).
-            tau:        Temperature for soft routing.
+            sample_ids: Global sample identity tensor of shape (B,).
             force_c:    If True, bypasses routing and uses only C-path.
             return_diagnostics: If True, return per-layer diagnostics.
 
         Returns:
             logits:    (B, n_classes) classification logits.
             routes:    List of soft routing weights per layer (B, 3).
+            entropies: List of per-layer entropy tensors (B,).
             diagnostics: Optional list of per-layer diagnostics dicts.
         """
         B, N = x.shape
         device = x.device
+        
+        # move memory to device lazily
+        if self.route_memory[0].device != device:
+            for i in range(self.n_layers):
+                self.route_memory[i] = self.route_memory[i].to(device)
 
         pos = torch.arange(N, device=device).unsqueeze(0).expand(B, -1)
         h = self.emb_drop(self.tok_emb(x) + self.pos_emb(pos))
 
         routes = []
+        entropies = []
         diagnostics = []
 
-        for layer in self.layers:
+        for i, layer in enumerate(self.layers):
+            prev_route = self.route_memory[i][sample_ids]
+            H_low, H_high, e_min, e_max = self.czu.get_thresholds(i)
+
             if return_diagnostics:
-                h, _, route_info, diag = layer(
-                    h, difficulty=difficulty, tau=tau, force_c=force_c, force_no_c=force_no_c, return_diagnostics=True,
+                h, entropy_norm, current_route, route_info, diag = layer(
+                    h, prev_route, H_low, H_high, e_min, e_max, force_c=force_c, return_diagnostics=True,
                 )
                 diagnostics.append(diag)
             else:
-                h, _, route_info = layer(h, difficulty=difficulty, tau=tau, force_c=force_c, force_no_c=force_no_c)
+                h, entropy_norm, current_route, route_info = layer(
+                    h, prev_route, H_low, H_high, e_min, e_max, force_c=force_c
+                )
+            
+            self.route_memory[i][sample_ids] = current_route.detach()
+            
             routes.append(route_info)
+            entropies.append(entropy_norm)
 
         # Mean pooling over sequence dimension
         pooled = self.norm_out(h).mean(dim=1)   # (B, D)
         logits = self.classifier(pooled)
         if return_diagnostics:
-            return logits, routes, diagnostics
-        return logits, routes
+            return logits, routes, entropies, diagnostics
+        return logits, routes, entropies

@@ -133,9 +133,10 @@ def _make_split(
 ) -> tuple:
     n = len(seqs)
     split = int(n * train_frac)
+    indices = torch.arange(n)
     return (
-        TensorDataset(seqs[:split], labels[:split]),
-        TensorDataset(seqs[split:], labels[split:]),
+        TensorDataset(seqs[:split], labels[:split], indices[:split]),
+        TensorDataset(seqs[split:], labels[split:], indices[split:]),
     )
 
 
@@ -213,7 +214,7 @@ def get_lra_listops_dataloaders(
             else:
                 ids = torch.cat([ids, torch.zeros(self.seq_len - n, dtype=torch.long)])
             ids = ids.clamp(0, self.vocab_size - 1)
-            return ids, torch.tensor(item["label"], dtype=torch.long)
+            return ids, torch.tensor(item["label"], dtype=torch.long), idx
 
     ds = load_dataset("hf-internal-testing/long-range-arena", "listops")
     train_ds = _ListOpsDS(ds["train"], seq_len, vocab_size)

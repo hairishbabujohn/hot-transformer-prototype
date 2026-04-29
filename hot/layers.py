@@ -63,53 +63,7 @@ class DepthwiseSepConv1d(nn.Module):
         return out
 
 
-# ---------------------------------------------------------------------------
-# Trainable Gate
-# ---------------------------------------------------------------------------
 
-class TrainableGate(nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-        self.norm = nn.LayerNorm(5)
-        self.mlp = nn.Sequential(
-            nn.Linear(5, 16),
-            nn.GELU(),
-            nn.Linear(16, 3)
-        )
-        # Initialize gate neutrally: final weights/bias = 0
-        nn.init.zeros_(self.mlp[2].weight)
-        nn.init.zeros_(self.mlp[2].bias)
-
-    def forward(self, x: torch.Tensor, difficulty: torch.Tensor) -> torch.Tensor:
-        """
-        Extract features and compute gate logits.
-        Args:
-            x: (B, N, D)
-            difficulty: (B,)
-        Returns:
-            logits: (B, 3)
-        """
-        B, N, D = x.shape
-        x_var = x.var(dim=(1,2), unbiased=False)
-
-        x_centered = x - x.mean(dim=-1, keepdim=True)
-        contrast = (x_centered ** 2).mean(dim=(1,2))
-
-        temporal_diff = (x[:,1:] - x[:,:-1]).abs().mean(dim=(1,2))
-
-        channel_var = x.var(dim=1, unbiased=False).mean(dim=1)
-
-        z = torch.stack([
-            x_var,
-            temporal_diff,
-            contrast,
-            channel_var,
-            difficulty
-        ], dim=-1)  # (B, 5)
-        features = self.norm(z)
-        
-        logits = self.mlp(features) # (B, 3)
-        return logits
 
 
 # ---------------------------------------------------------------------------
@@ -157,8 +111,7 @@ class HoTLayer(nn.Module):
         # Pre-norm applied before routing
         self.norm_pre = nn.LayerNorm(d_model)
         
-        # Gate
-        self.gate = TrainableGate()
+
 
         # Path B
         self.path_b = DepthwiseSepConv1d(d_model, conv_kernel_size)
@@ -168,8 +121,8 @@ class HoTLayer(nn.Module):
             d_model, n_heads, dropout=dropout, batch_first=True,
         )
 
-        # Pathway Merger: learned scalar alpha (initialized 0.25)
-        self.alpha = nn.Parameter(torch.ones(1) * 0.25)
+        # Pathway Merger: learned scalar alpha (initialized 0.15)
+        self.alpha = nn.Parameter(torch.ones(1) * 0.15)
 
     # ------------------------------------------------------------------
     # Forward
@@ -178,68 +131,75 @@ class HoTLayer(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        difficulty: torch.Tensor,
-        tau: float = 1.0,
+        prev_route: torch.Tensor,
+        H_low: float,
+        H_high: float,
+        e_min: float,
+        e_max: float,
         force_c: bool = False,
-        force_no_c: bool = False,
         return_diagnostics: bool = False,
     ) -> tuple:
-        """Run one HoT layer.
-
-        Args:
-            x:          Input tensor (B, N, D).
-            difficulty: Per-sample difficulty tensor (B,).
-            tau:        Temperature for softmax gate.
-
-        Returns:
-            x_next:     Output tensor (B, N, D).
-            route_info: Tensor [B, 3] of soft gate weights.
-            diagnostics: Optional dict of diagnostics.
-        """
         B = x.shape[0]
-        # --- Pre-norm ---
         x_norm = self.norm_pre(x)
 
-        # --- Homeostatic Gate ---
-        gate_logits = self.gate(x_norm, difficulty) # (B, 3)
+        x_c = x_norm - x_norm.mean(dim=-1, keepdim=True)
+        x_s = x_c / (x_c.std(dim=-1, keepdim=True) + 1e-6)
+        scores = (x_s ** 2).mean(dim=-1)                 # (B, T)
+
+        import math
+        probs = torch.softmax(scores, dim=-1)
+        raw_entropy = -(probs * torch.log(probs + 1e-9)).sum(dim=-1)  # (B,)
+        raw_entropy = raw_entropy / math.log(scores.size(-1))
+        
+        entropy_norm = (raw_entropy - e_min) / (e_max - e_min + 1e-6)
+        entropy_norm = entropy_norm.clamp(0.0, 1.0)
+
         if force_c:
-            g = torch.tensor([0.0, 0.0, 1.0], device=x.device, dtype=x.dtype).unsqueeze(0).expand(B, -1)
-        elif force_no_c:
-            g = torch.tensor([0.5, 0.5, 0.0], device=x.device, dtype=x.dtype).unsqueeze(0).expand(B, -1)
+            gA = torch.zeros(B, dtype=torch.bool, device=x.device)
+            gB = torch.zeros(B, dtype=torch.bool, device=x.device)
+            gC = torch.ones(B, dtype=torch.bool, device=x.device)
+            current_route = torch.full((B,), 2, dtype=torch.long, device=x.device)
         else:
-            g = torch.softmax(gate_logits / tau, dim=-1) # (B, 3)
-            g = g.clamp(min=1e-6)
-            g = g / g.sum(dim=-1, keepdim=True)
-        
-        gA = g[:, 0].view(-1, 1, 1)
-        gB = g[:, 1].view(-1, 1, 1)
-        gC = g[:, 2].view(-1, 1, 1)
+            delta = 0.02
+            stay_A = (prev_route == 0) & (entropy_norm < H_low + delta)
+            stay_C = (prev_route == 2) & (entropy_norm > H_high - delta)
 
-        # Compute all paths (soft routing)
-        path_a_out = x
-        
-        path_b_out = self.path_b(x_norm)
-        scale = x.norm(dim=(1, 2), keepdim=True) / (path_b_out.norm(dim=(1, 2), keepdim=True) + 1e-6)
-        path_b_out = path_b_out * scale
-        
-        path_c_out, _ = self.path_c_attn(x_norm, x_norm, x_norm)
+            new_A = entropy_norm < (H_low - delta)
+            new_C = entropy_norm > (H_high + delta)
 
-        path_out = gA * path_a_out + gB * path_b_out + gC * path_c_out
+            gA = stay_A | new_A
+            gC = stay_C | new_C
+            gB = ~(gA | gC)
+            
+            current_route = torch.zeros(B, dtype=torch.long, device=x.device)
+            current_route[gB] = 1
+            current_route[gC] = 2
 
-        # --- Pathway Merger: x_next = x + alpha * path_output ---
+        mA = gA.float().view(-1, 1, 1)
+        mB = gB.float().view(-1, 1, 1)
+        mC = gC.float().view(-1, 1, 1)
+
+        g = torch.stack([gA.float(), gB.float(), gC.float()], dim=-1)
+
+        outA = x
+        outB = self.path_b(x_norm)
+        scale = x.norm(dim=(1, 2), keepdim=True) / (outB.norm(dim=(1, 2), keepdim=True) + 1e-6)
+        outB = outB * scale
+        outC, _ = self.path_c_attn(x_norm, x_norm, x_norm)
+
+        path_out = mA * outA + mB * outB + mC * outC
         x_next = x + self.alpha * path_out
 
         if not return_diagnostics:
-            return x_next, None, g
+            return x_next, entropy_norm, current_route, g
 
-        # Note: Do not detach g here, we want diagnostics/metrics to be computable
         g_mean = g.mean(dim=0).detach() # (3,)
         
         with torch.no_grad():
-            y_full = x + self.alpha * (gA * path_a_out + gB * path_b_out + gC * path_c_out)
-            y_no_a = x + self.alpha * (gB * path_b_out + gC * path_c_out)
-            y_no_b = x + self.alpha * (gA * path_a_out + gC * path_c_out)
-            y_no_c = x + self.alpha * (gA * path_a_out + gB * path_b_out)
+            y_full = x + self.alpha * (gA.float().view(-1,1,1) * outA + gB.float().view(-1,1,1) * outB + gC.float().view(-1,1,1) * outC)
+            y_no_a = x + self.alpha * (gB.float().view(-1,1,1) * outB + gC.float().view(-1,1,1) * outC)
+            y_no_b = x + self.alpha * (gA.float().view(-1,1,1) * outA + gC.float().view(-1,1,1) * outC)
+            y_no_c = x + self.alpha * (gA.float().view(-1,1,1) * outA + gB.float().view(-1,1,1) * outB)
 
             def mean_norm(t: torch.Tensor) -> torch.Tensor:
                 return torch.linalg.norm(t, dim=(1, 2)).mean()
@@ -254,16 +214,13 @@ class HoTLayer(nn.Module):
             b_ratio = b_impact / denom
             c_ratio = c_impact / (a_impact + b_impact + c_impact + 1e-9)
 
-            # Gate entropy computed on g before clamp/detach? g is already clamped.
-            gate_entropy = -(g * (g + 1e-9).log()).sum(dim=-1).mean()
-
             diagnostics = {
                 "x_block_in": x.detach(),
                 "alpha": self.alpha.detach(),
                 "g": g_mean,
-                "A": path_a_out.detach(),
-                "B": path_b_out.detach(),
-                "C": path_c_out.detach(),
+                "A": outA.detach(),
+                "B": outB.detach(),
+                "C": outC.detach(),
                 "y_full": y_full.detach(),
                 "y_noA": y_no_a.detach(),
                 "y_noB": y_no_b.detach(),
@@ -275,7 +232,8 @@ class HoTLayer(nn.Module):
                 "A_ratio": a_ratio.detach(),
                 "B_ratio": b_ratio.detach(),
                 "C_ratio": c_ratio.detach(),
-                "gate_entropy": gate_entropy.detach(),
+                "route_change_rate": (current_route != prev_route).float().mean(),
+                "gate_entropy": torch.tensor(0.0),
             }
 
-        return x_next, None, g, diagnostics
+        return x_next, entropy_norm, current_route, g, diagnostics
