@@ -64,7 +64,7 @@ class DepthwiseSepConv1d(nn.Module):
         expand_ratio: Expansion ratio for 1x1 conv (default 2).
     """
 
-    def __init__(self, d_model: int, kernel_size: int = 7, expand_ratio: int = 2) -> None:
+    def __init__(self, d_model: int, kernel_size: int = 7, expand_ratio: int = 4) -> None:
         super().__init__()
         pad = kernel_size // 2
         expanded_dim = d_model * expand_ratio

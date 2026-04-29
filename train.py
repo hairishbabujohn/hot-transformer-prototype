@@ -349,7 +349,8 @@ def train_loop(
     tau_end = 1.0
     tau_steps = 2000
 
-    lambda_c = 0.1
+    lambda_c = 0.02
+    delta_c = 0.05
     lambda_bal = 0.01
     lambda_entropy = 0.005
     
@@ -376,6 +377,9 @@ def train_loop(
             # Compute penalty
             loss_c = lambda_c * g_stack[:, :, 2].mean()
             
+            # Minimum attention constraint
+            loss_min_c = delta_c * torch.relu(0.05 - g_stack[:, :, 2].mean())
+            
             # Balance regularization
             g_mean_total = g_stack.mean(dim=(0, 1)) # (3,)
             loss_bal = lambda_bal * ((g_mean_total - target_bal)**2).sum()
@@ -385,7 +389,7 @@ def train_loop(
             g_entropy = -(g_stack * torch.log(g_stack + 1e-9)).sum(dim=-1).mean()
             loss_ent = lambda_entropy * (1.0 - g_entropy)
             
-            loss = loss_task + loss_c + loss_bal + loss_ent
+            loss = loss_task + loss_c + loss_min_c + loss_bal + loss_ent
         else:
             loss = loss_task
 
@@ -423,7 +427,7 @@ def train_loop(
             if force_c_only:
                 loss_str = f"loss={loss.item():.4f}"
             else:
-                loss_str = f"task={loss_task.item():.4f} c={loss_c.item():.4f} bal={loss_bal.item():.4f} ent={loss_ent.item():.4f} tot={loss.item():.4f}"
+                loss_str = f"task={loss_task.item():.4f} c={loss_c.item():.4f} min_c={loss_min_c.item():.4f} bal={loss_bal.item():.4f} ent={loss_ent.item():.4f} tot={loss.item():.4f}"
 
             print(
                 f"[train:{run_label}] step={step}/{total_steps} {loss_str} "
