@@ -75,6 +75,7 @@ class HoTEncoder(nn.Module):
         x: torch.Tensor,
         thresholds: list,
         force_c: bool = False,
+        return_diagnostics: bool = False,
     ) -> tuple:
         """Run the encoder and return classification logits.
 
@@ -83,6 +84,7 @@ class HoTEncoder(nn.Module):
             thresholds: List of ``(H_low, H_high)`` tuples, one per layer.
                         Typically returned by ``CZU.get_all_thresholds()``.
             force_c:    If True, force all layers to use Path C (CZU warmup).
+            return_diagnostics: If True, return per-layer diagnostics.
 
         Returns:
             logits:    (B, n_classes) classification logits.
@@ -90,6 +92,7 @@ class HoTEncoder(nn.Module):
             routes:    List of route info per layer.
                        During training: Tensor [w_A, w_B, w_C] (soft weights).
                        During eval / force_c: Integer path index (0 / 1 / 2).
+            diagnostics: Optional list of per-layer diagnostics dicts.
         """
         B, N = x.shape
         device = x.device
@@ -99,14 +102,23 @@ class HoTEncoder(nn.Module):
 
         oem_vals = []
         routes = []
+        diagnostics = []
 
         for i, layer in enumerate(self.layers):
             H_low, H_high = thresholds[i]
-            h, oem_val, route_info = layer(h, H_low, H_high, force_c=force_c)
+            if return_diagnostics:
+                h, oem_val, route_info, diag = layer(
+                    h, H_low, H_high, force_c=force_c, return_diagnostics=True,
+                )
+                diagnostics.append(diag)
+            else:
+                h, oem_val, route_info = layer(h, H_low, H_high, force_c=force_c)
             oem_vals.append(oem_val)
             routes.append(route_info)
 
         # Mean pooling over sequence dimension
         pooled = self.norm_out(h).mean(dim=1)   # (B, D)
         logits = self.classifier(pooled)
+        if return_diagnostics:
+            return logits, oem_vals, routes, diagnostics
         return logits, oem_vals, routes
