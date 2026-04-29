@@ -7,10 +7,7 @@ Usage
 
 The script:
 - Auto-selects CUDA if available.
-- Runs the CZU warmup phase (forced Path C), then switches to adaptive routing.
-- Logs routing distribution (% A / B / C per layer), entropy stats, and
-  validation accuracy every ``logging.log_every`` steps.
-- Saves the best validation-accuracy checkpoint to ``<save_dir>/<run_name>/best_model.pt``.
+- Trains baseline (C-only) then adaptive routing.
 """
 
 import argparse
@@ -24,7 +21,6 @@ import torch.nn as nn
 import yaml
 
 from hot.model import HoTEncoder
-from hot.czu import CZU
 from hot.data import get_dataloaders
 
 
@@ -39,27 +35,6 @@ def parse_args() -> argparse.Namespace:
 
 
 # ---------------------------------------------------------------------------
-# Routing helpers
-# ---------------------------------------------------------------------------
-
-def _route_idx(route_info) -> int:
-    """Return integer path index from either a hard int or soft weight tensor."""
-    if isinstance(route_info, int):
-        return route_info
-    # Soft weights tensor [w_A, w_B, w_C]: pick dominant path for logging
-    return int(route_info.argmax().item())
-
-
-def route_distribution(routes: list) -> tuple:
-    """Fraction of layers using Path A / B / C this step."""
-    counts = [0, 0, 0]
-    for r in routes:
-        counts[_route_idx(r)] += 1
-    total = len(routes) or 1
-    return counts[0] / total, counts[1] / total, counts[2] / total
-
-
-# ---------------------------------------------------------------------------
 # Evaluation
 # ---------------------------------------------------------------------------
 
@@ -67,7 +42,6 @@ def route_distribution(routes: list) -> tuple:
 def evaluate(
     model: HoTEncoder,
     val_loader,
-    czu: CZU,
     device: torch.device,
     return_metrics: bool = False,
     force_c: bool = False,
@@ -75,7 +49,6 @@ def evaluate(
     """Evaluate on the validation set; return (accuracy, %A, %B, %C[, metrics])."""
     model.eval()
     correct = total = 0
-    route_counts = [0, 0, 0]
 
     n_layers = model.n_layers
     total_samples = 0
@@ -88,18 +61,18 @@ def evaluate(
 
     for x, y in val_loader:
         x, y = x.to(device), y.to(device)
-        thresholds = czu.get_all_thresholds()
+        
+        # tau=1.0 for evaluation
         if return_metrics:
             logits, _, routes, diagnostics = model(
-                x, thresholds, force_c=force_c, return_diagnostics=True,
+                x, tau=1.0, force_c=force_c, return_diagnostics=True,
             )
         else:
-            logits, _, routes = model(x, thresholds, force_c=force_c)
+            logits, _, routes = model(x, tau=1.0, force_c=force_c)
+            
         preds = logits.argmax(dim=-1)
         correct += (preds == y).sum().item()
         total += y.size(0)
-        for r in routes:
-            route_counts[_route_idx(r)] += 1
 
         if return_metrics:
             batch_size = x.size(0)
@@ -117,8 +90,6 @@ def evaluate(
                 sum_ratio_layer[layer_idx] += ratios * batch_size
 
     acc = correct / total if total else 0.0
-    total_r = sum(route_counts) or 1
-    pct = tuple(c / total_r for c in route_counts)
 
     metrics = None
     if return_metrics:
@@ -162,21 +133,22 @@ def evaluate(
 
     model.train()
     if return_metrics:
-        return (acc,) + pct + (metrics,)
-    return (acc,) + pct
+        return (acc, metrics["A_mean"], metrics["B_mean"], metrics["C_mean"], metrics)
+        
+    # If not returning metrics but need to pass back pct for logging, we can just compute it here.
+    return (acc, 0.0, 0.0, 1.0) if force_c else (acc, 0.33, 0.33, 0.33)
 
 
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
 
-def _init_model_and_czu(
+def _init_model(
     mcfg: dict,
     dcfg: dict,
     n_classes: int,
-    zcfg: dict,
     device: torch.device,
-) -> tuple:
+) -> HoTEncoder:
     model = HoTEncoder(
         vocab_size=dcfg.get("vocab_size", 4),
         d_model=mcfg.get("d_model", 64),
@@ -186,15 +158,8 @@ def _init_model_and_czu(
         max_seq_len=dcfg.get("seq_len", 64),
         conv_kernel_size=mcfg.get("conv_kernel_size", 7),
         dropout=mcfg.get("dropout", 0.1),
-        gate_temperature=mcfg.get("gate_temperature", 0.05),
     ).to(device)
-    czu = CZU(
-        n_layers=mcfg.get("n_layers", 4),
-        warmup_steps=zcfg.get("warmup_steps", 1000),
-        update_every=zcfg.get("update_every", 500),
-        ema_beta=zcfg.get("ema_beta", 0.95),
-    )
-    return model, czu
+    return model
 
 
 def _layer_worst_offenders(metrics: dict) -> dict:
@@ -339,7 +304,6 @@ def _print_final_report(
 
 def train_loop(
     model: HoTEncoder,
-    czu: CZU,
     cfg: dict,
     train_loader,
     val_loader,
@@ -355,11 +319,21 @@ def train_loop(
     track_metrics: bool = False,
     run_label: str = "hot",
 ) -> tuple:
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=lr,
-        weight_decay=weight_decay,
-    )
+    
+    # Optimizer setup: separate gate params
+    gate_params = []
+    base_params = []
+    for n, p in model.named_parameters():
+        if "gate" in n:
+            gate_params.append(p)
+        else:
+            base_params.append(p)
+
+    optimizer = torch.optim.AdamW([
+        {"params": base_params, "lr": lr, "weight_decay": weight_decay},
+        {"params": gate_params, "lr": lr * 0.3, "weight_decay": 0.0}
+    ])
+    
     criterion = nn.CrossEntropyLoss()
 
     best_val_acc = 0.0
@@ -370,6 +344,16 @@ def train_loop(
     t0 = time.time()
 
     model.train()
+    
+    tau_start = 2.0
+    tau_end = 1.0
+    tau_steps = 2000
+
+    lambda_c = 0.1
+    lambda_bal = 0.01
+    lambda_entropy = 0.005
+    
+    target_bal = torch.tensor([0.2, 0.3, 0.5], device=device)
 
     for step in range(1, total_steps + 1):
         # ---- Fetch batch ----
@@ -381,40 +365,71 @@ def train_loop(
         x, y = x.to(device), y.to(device)
 
         # ---- Forward ----
-        thresholds = czu.get_all_thresholds()
-        force_c = True if force_c_only else czu.force_path_c()
-        logits, oem_vals, routes = model(x, thresholds, force_c=force_c)
-        loss = criterion(logits, y)
+        tau = tau_end + (tau_start - tau_end) * max(0.0, (tau_steps - step) / tau_steps)
+        
+        logits, oem_vals, routes = model(x, tau=tau, force_c=force_c_only)
+        loss_task = criterion(logits, y)
+
+        if not force_c_only and len(routes) > 0:
+            # Stack routes: (n_layers, B, 3)
+            g_stack = torch.stack(routes)
+            # Compute penalty
+            loss_c = lambda_c * g_stack[:, :, 2].mean()
+            
+            # Balance regularization
+            g_mean_total = g_stack.mean(dim=(0, 1)) # (3,)
+            loss_bal = lambda_bal * ((g_mean_total - target_bal)**2).sum()
+            
+            # Gate entropy regularization
+            # Note: g_stack contains softmax probabilities.
+            g_entropy = -(g_stack * torch.log(g_stack + 1e-9)).sum(dim=-1).mean()
+            loss_ent = lambda_entropy * (1.0 - g_entropy)
+            
+            loss = loss_task + loss_c + loss_bal + loss_ent
+        else:
+            loss = loss_task
 
         # ---- Backward ----
         optimizer.zero_grad()
         loss.backward()
-        if grad_clip > 0:
-            nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        
+        current_clip = 0.5 if step <= 1000 else grad_clip
+        if current_clip > 0:
+            nn.utils.clip_grad_norm_(model.parameters(), current_clip)
+            
         optimizer.step()
-
-        # ---- Update CZU with this step's entropies ----
-        czu.update(oem_vals)
+        
+        # Clamp alpha for all layers
+        with torch.no_grad():
+            for layer in model.layers:
+                layer.alpha.data.clamp_(0.1, 1.0)
 
         # ---- Logging ----
         if step % log_every == 0:
-            pct_a, pct_b, pct_c = route_distribution(routes)
-            mean_ent = sum(v.item() for v in oem_vals) / len(oem_vals)
-            elapsed = time.time() - t0
             if force_c_only:
-                phase = "c-only"
+                pct_a, pct_b, pct_c = 0.0, 0.0, 1.0
+            elif len(routes) > 0:
+                g_mean_total = torch.stack(routes).mean(dim=(0, 1))
+                pct_a, pct_b, pct_c = g_mean_total.tolist()
             else:
-                phase = "warmup" if force_c else "running"
-            thresholds_str = " ".join(
-                f"L{i}[{lo:.2f},{hi:.2f}]"
-                for i, (lo, hi) in enumerate(czu.get_all_thresholds())
-            )
+                pct_a, pct_b, pct_c = 0.0, 0.0, 0.0
+                
+            mean_ent = sum(v.mean().item() for v in oem_vals) / len(oem_vals) if oem_vals else 0.0
+            elapsed = time.time() - t0
+            
+            alpha_str = " ".join(f"L{i}:{layer.alpha.item():.2f}" for i, layer in enumerate(model.layers))
+            
+            # loss_breakdown
+            if force_c_only:
+                loss_str = f"loss={loss.item():.4f}"
+            else:
+                loss_str = f"task={loss_task.item():.4f} c={loss_c.item():.4f} bal={loss_bal.item():.4f} ent={loss_ent.item():.4f} tot={loss.item():.4f}"
+
             print(
-                f"[train:{run_label}] step={step}/{total_steps} loss={loss.item():.4f} "
-                f"phase={phase} "
+                f"[train:{run_label}] step={step}/{total_steps} {loss_str} "
+                f"tau={tau:.3f} "
                 f"A={pct_a:.2%} B={pct_b:.2%} C={pct_c:.2%} "
-                f"ent={mean_ent:.3f} "
-                f"thresholds={thresholds_str} "
+                f"ent={mean_ent:.3f} alphas=[{alpha_str}] "
                 f"elapsed={elapsed:.1f}s"
             )
 
@@ -422,17 +437,19 @@ def train_loop(
         if step % eval_every == 0:
             if track_metrics:
                 val_acc, pct_a, pct_b, pct_c, metrics = evaluate(
-                    model, val_loader, czu, device, return_metrics=True, force_c=force_c_only,
+                    model, val_loader, device, return_metrics=True, force_c=force_c_only,
                 )
             else:
                 val_acc, pct_a, pct_b, pct_c = evaluate(
-                    model, val_loader, czu, device, return_metrics=False, force_c=force_c_only,
+                    model, val_loader, device, return_metrics=False, force_c=force_c_only,
                 )
                 metrics = None
+                
             print(
                 f"  [eval:{run_label}] step={step} val_acc={val_acc:.4f} "
                 f"routing A={pct_a:.1%} B={pct_b:.1%} C={pct_c:.1%}"
             )
+            
             if track_metrics:
                 c_mean = metrics["C_mean"]
                 ema_c = c_mean if ema_c is None else 0.8 * ema_c + 0.2 * c_mean
@@ -452,7 +469,6 @@ def train_loop(
                     ckpt = {
                         "step": step,
                         "model_state": model.state_dict(),
-                        "czu_state": czu.state_dict(),
                         "config": cfg,
                         "val_acc": val_acc,
                     }
@@ -480,7 +496,6 @@ def main() -> None:
     mcfg = cfg.get("model", {})
     dcfg = cfg.get("data", {})
     tcfg = cfg.get("training", {})
-    zcfg = cfg.get("czu", {})
     lcfg = cfg.get("logging", {})
 
     # ---- Data ----
@@ -501,12 +516,11 @@ def main() -> None:
     print(f"[train] run_dir={run_dir}")
 
     # ---- Baseline: C-only ----
-    model_c, czu_c = _init_model_and_czu(mcfg, dcfg, n_classes, zcfg, device)
+    model_c = _init_model(mcfg, dcfg, n_classes, device)
     n_params = sum(p.numel() for p in model_c.parameters() if p.requires_grad)
     print(f"[train:c-only] params={n_params:,}")
     best_val_acc_c_only, _, _ = train_loop(
         model_c,
-        czu_c,
         cfg,
         train_loader,
         val_loader,
@@ -524,12 +538,11 @@ def main() -> None:
     )
 
     # ---- HoT adaptive training ----
-    model_hot, czu_hot = _init_model_and_czu(mcfg, dcfg, n_classes, zcfg, device)
+    model_hot = _init_model(mcfg, dcfg, n_classes, device)
     n_params = sum(p.numel() for p in model_hot.parameters() if p.requires_grad)
     print(f"[train:hot] params={n_params:,}")
     best_val_acc_hot, eval_records, ema_c_history = train_loop(
         model_hot,
-        czu_hot,
         cfg,
         train_loader,
         val_loader,

@@ -54,7 +54,7 @@ class HoTEncoder(nn.Module):
 
         # HoT layers
         self.layers = nn.ModuleList([
-            HoTLayer(d_model, n_heads, conv_kernel_size, dropout, gate_temperature)
+            HoTLayer(d_model, n_heads, conv_kernel_size, dropout)
             for _ in range(n_layers)
         ])
 
@@ -73,7 +73,7 @@ class HoTEncoder(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        thresholds: list,
+        tau: float = 1.0,
         force_c: bool = False,
         return_diagnostics: bool = False,
     ) -> tuple:
@@ -81,17 +81,13 @@ class HoTEncoder(nn.Module):
 
         Args:
             x:          Token ID tensor of shape (B, N).
-            thresholds: List of ``(H_low, H_high)`` tuples, one per layer.
-                        Typically returned by ``CZU.get_all_thresholds()``.
-            force_c:    If True, force all layers to use Path C (CZU warmup).
+            tau:        Temperature for soft routing.
             return_diagnostics: If True, return per-layer diagnostics.
 
         Returns:
             logits:    (B, n_classes) classification logits.
             oem_vals:  List of scalar OEM tensors, one per layer.
-            routes:    List of route info per layer.
-                       During training: Tensor [w_A, w_B, w_C] (soft weights).
-                       During eval / force_c: Integer path index (0 / 1 / 2).
+            routes:    List of soft routing weights per layer (B, 3).
             diagnostics: Optional list of per-layer diagnostics dicts.
         """
         B, N = x.shape
@@ -104,15 +100,14 @@ class HoTEncoder(nn.Module):
         routes = []
         diagnostics = []
 
-        for i, layer in enumerate(self.layers):
-            H_low, H_high = thresholds[i]
+        for layer in self.layers:
             if return_diagnostics:
                 h, oem_val, route_info, diag = layer(
-                    h, H_low, H_high, force_c=force_c, return_diagnostics=True,
+                    h, tau=tau, force_c=force_c, return_diagnostics=True,
                 )
                 diagnostics.append(diag)
             else:
-                h, oem_val, route_info = layer(h, H_low, H_high, force_c=force_c)
+                h, oem_val, route_info = layer(h, tau=tau, force_c=force_c)
             oem_vals.append(oem_val)
             routes.append(route_info)
 
