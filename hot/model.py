@@ -1,36 +1,16 @@
-"""
-HoTEncoder: encoder-only sequence classifier built from HoT layers.
-"""
+"""Encoder-only classifier built from Homeostatic Transformer layers."""
+
+from __future__ import annotations
 
 import torch
 import torch.nn as nn
 
-from .layers import HoTLayer
 from .czu import CZU
+from .layers import HoTLayer
 
 
 class HoTEncoder(nn.Module):
-    """Encoder-only classifier using Homeostatic Transformer layers.
-
-    Architecture::
-
-        Token Embedding + Positional Embedding
-              ↓   (dropout)
-        N × HoTLayer
-              ↓
-        LayerNorm → mean-pool over sequence → Linear classifier
-
-    Args:
-        vocab_size:       Size of token vocabulary.
-        d_model:          Hidden dimension.
-        n_layers:         Number of HoT layers.
-        n_heads:          Attention heads (used by Path C in each layer).
-        n_classes:        Number of output classes.
-        max_seq_len:      Maximum sequence length (for positional embedding).
-        conv_kernel_size: Kernel size for Path B conv (default 7).
-        dropout:          Embedding dropout and attention dropout (default 0.1).
-        gate_temperature: Sigmoid sharpness for soft routing (default 0.05).
-    """
+    """Encoder-only sequence classifier using stacked HoT layers."""
 
     def __init__(
         self,
@@ -42,30 +22,41 @@ class HoTEncoder(nn.Module):
         max_seq_len: int,
         conv_kernel_size: int = 7,
         dropout: float = 0.1,
-        dataset_size: int = 100000,
+        gate_temperature: float = 0.05,
+        czu_warmup_steps: int = 1000,
+        czu_update_every: int = 500,
+        czu_ema_beta: float = 0.95,
+        dataset_size: int | None = None,
     ) -> None:
         super().__init__()
+        del dataset_size
         self.d_model = d_model
         self.n_layers = n_layers
 
-        # Input embeddings
         self.tok_emb = nn.Embedding(vocab_size, d_model)
         self.pos_emb = nn.Embedding(max_seq_len, d_model)
         self.emb_drop = nn.Dropout(dropout)
 
-        # HoT layers
-        self.layers = nn.ModuleList([
-            HoTLayer(d_model, n_heads, conv_kernel_size, dropout)
-            for _ in range(n_layers)
-        ])
-        
-        self.czu = CZU(n_layers, warmup_steps=500)
-        self.route_memory = {
-            i: torch.full((dataset_size,), 2, dtype=torch.long)
-            for i in range(n_layers)
-        }
+        self.layers = nn.ModuleList(
+            [
+                HoTLayer(
+                    d_model=d_model,
+                    n_heads=n_heads,
+                    conv_kernel_size=conv_kernel_size,
+                    dropout=dropout,
+                    gate_temperature=gate_temperature,
+                )
+                for _ in range(n_layers)
+            ]
+        )
 
-        # Output head
+        self.czu = CZU(
+            n_layers=n_layers,
+            warmup_steps=czu_warmup_steps,
+            update_every=czu_update_every,
+            ema_beta=czu_ema_beta,
+        )
+
         self.norm_out = nn.LayerNorm(d_model)
         self.classifier = nn.Linear(d_model, n_classes)
 
@@ -80,60 +71,51 @@ class HoTEncoder(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        sample_ids: torch.Tensor,
+        sample_ids: torch.Tensor | None = None,
         force_c: bool = False,
         return_diagnostics: bool = False,
     ) -> tuple:
-        """Run the encoder and return classification logits.
+        """Run the encoder.
 
-        Args:
-            x:          Token ID tensor of shape (B, N).
-            sample_ids: Global sample identity tensor of shape (B,).
-            force_c:    If True, bypasses routing and uses only C-path.
-            return_diagnostics: If True, return per-layer diagnostics.
-
-        Returns:
-            logits:    (B, n_classes) classification logits.
-            routes:    List of soft routing weights per layer (B, 3).
-            entropies: List of per-layer entropy tensors (B,).
-            diagnostics: Optional list of per-layer diagnostics dicts.
+        ``sample_ids`` is accepted for backward compatibility with older
+        dataloaders, but routing is now purely per-layer/per-sample as described
+        in the patent.
         """
-        B, N = x.shape
-        device = x.device
-        
-        # move memory to device lazily
-        if self.route_memory[0].device != device:
-            for i in range(self.n_layers):
-                self.route_memory[i] = self.route_memory[i].to(device)
+        del sample_ids
 
-        pos = torch.arange(N, device=device).unsqueeze(0).expand(B, -1)
+        batch_size, seq_len = x.shape
+        device = x.device
+        pos = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
         h = self.emb_drop(self.tok_emb(x) + self.pos_emb(pos))
 
         routes = []
         entropies = []
         diagnostics = []
 
-        for i, layer in enumerate(self.layers):
-            prev_route = self.route_memory[i][sample_ids]
-            H_low, H_high, e_min, e_max = self.czu.get_thresholds(i)
-
+        for layer_idx, layer in enumerate(self.layers):
+            H_low, H_high = self.czu.get_thresholds(layer_idx)
             if return_diagnostics:
-                h, entropy_norm, current_route, route_info, diag = layer(
-                    h, prev_route, H_low, H_high, e_min, e_max, force_c=force_c, return_diagnostics=True,
+                h, entropy, route_idx, route_info, diag = layer(
+                    h,
+                    H_low=H_low,
+                    H_high=H_high,
+                    force_c=force_c,
+                    return_diagnostics=True,
                 )
                 diagnostics.append(diag)
             else:
-                h, entropy_norm, current_route, route_info = layer(
-                    h, prev_route, H_low, H_high, e_min, e_max, force_c=force_c
+                h, entropy, route_idx, route_info = layer(
+                    h,
+                    H_low=H_low,
+                    H_high=H_high,
+                    force_c=force_c,
                 )
-            
-            self.route_memory[i][sample_ids] = current_route.detach()
-            
-            routes.append(route_info)
-            entropies.append(entropy_norm)
 
-        # Mean pooling over sequence dimension
-        pooled = self.norm_out(h).mean(dim=1)   # (B, D)
+            del route_idx
+            routes.append(route_info)
+            entropies.append(entropy)
+
+        pooled = self.norm_out(h).mean(dim=1)
         logits = self.classifier(pooled)
         if return_diagnostics:
             return logits, routes, entropies, diagnostics

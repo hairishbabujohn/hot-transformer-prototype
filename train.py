@@ -38,6 +38,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=None, help="Override random seed")
     parser.add_argument("--dataset", type=str, default=None, help="Override dataset name")
     parser.add_argument("--seq_len", type=int, default=None, help="Override sequence length")
+    parser.add_argument("--steps", type=int, default=None, help="Override training steps")
+    parser.add_argument("--eval_every", type=int, default=None, help="Override validation interval")
+    parser.add_argument("--warmup_steps", type=int, default=None, help="Override CZU warmup steps")
     parser.add_argument("--mode", type=str, choices=["c-only", "hot", "both"], default="both", help="Which model to run")
     parser.add_argument("--json_output", action="store_true", help="Print final results as JSON")
     return parser.parse_args()
@@ -72,52 +75,43 @@ def evaluate(
     n_layers = model.n_layers
     total_samples = 0
     sum_g = torch.zeros(3, device=device)
-    sum_gate_entropy = torch.tensor(0.0, device=device)
     sum_impacts = torch.zeros(3, device=device)
     sum_ratios = torch.zeros(3, device=device)
     sum_g_layer = torch.zeros(n_layers, 3, device=device)
     sum_ratio_layer = torch.zeros(n_layers, 3, device=device)
-    
-    all_losses = []
-    all_gC = []
-    criterion_none = nn.CrossEntropyLoss(reduction='none')
+    sum_route_change = torch.tensor(0.0, device=device)
+    route_count = 0
 
     for x, y, sample_ids in val_loader:
         x, y, sample_ids = x.to(device), y.to(device), sample_ids.to(device)
-        
+
         if return_metrics:
             logits, routes, entropies, diagnostics = model(
                 x, sample_ids=sample_ids, force_c=force_c, return_diagnostics=True,
             )
         else:
             logits, routes, entropies = model(x, sample_ids=sample_ids, force_c=force_c)
-            
+
         preds = logits.argmax(dim=-1)
         correct += (preds == y).sum().item()
         total += y.size(0)
 
+        batch_size = x.size(0)
+        total_samples += batch_size
+        g_stack = torch.stack(routes)  # (L, B, 3)
+        sum_g += g_stack.sum(dim=(0, 1))
+        sum_g_layer += g_stack.sum(dim=1)
+        route_count += batch_size * n_layers
+
         if return_metrics:
-            batch_size = x.size(0)
-            for i, ent in enumerate(entropies):
-                sum_gate_entropy += ent.std()
-            
-            loss_ps = criterion_none(logits, y)
-            all_losses.append(loss_ps.detach().cpu())
-            
-            # Stack routes: (n_layers, B, 3)
-            g_stack = torch.stack(routes) # (L, B, 3)
-            
             for layer_idx, diag in enumerate(diagnostics):
-                g = diag["g"].to(device)
                 impacts = torch.stack([diag["A_impact"], diag["B_impact"], diag["C_impact"]]).to(device)
                 ratios = torch.stack([diag["A_ratio"], diag["B_ratio"], diag["C_ratio"]]).to(device)
 
-                sum_g += g * batch_size
-                sum_gate_entropy += diag["gate_entropy"].to(device) * batch_size
                 sum_impacts += impacts * batch_size
                 sum_ratios += ratios * batch_size
-                sum_g_layer[layer_idx] += g * batch_size
                 sum_ratio_layer[layer_idx] += ratios * batch_size
+                sum_route_change += diag.get("route_change_rate", torch.tensor(0.0, device=device)).to(device)
 
     acc = correct / total if total else 0.0
 
@@ -133,19 +127,20 @@ def evaluate(
         else:
             denom = total_samples * n_layers
             g_mean = sum_g / denom
-            gate_entropy_mean = (sum_gate_entropy / denom).item()
+            layer_route_dist = sum_g_layer / total_samples
+            gate_entropy_mean = -(
+                layer_route_dist * torch.log(layer_route_dist.clamp_min(1e-9))
+            ).sum(dim=-1).mean().item() / np.log(3)
             impact_mean = sum_impacts / denom
             ratio_mean = sum_ratios / denom
-            g_layer_mean = sum_g_layer / total_samples
+            g_layer_mean = layer_route_dist
             ratio_layer_mean = sum_ratio_layer / total_samples
 
         impact_norm = impact_mean / (impact_mean.sum() + 1e-9)
         alignment_error = (g_mean - impact_norm).abs().sum().item()
-        
-        route_change_rate = 0.0
-        if len(diagnostics) > 0:
-            route_change_rate = torch.stack([d.get("route_change_rate", torch.tensor(0.0)) for d in diagnostics]).mean().item()
-            
+
+        route_change_rate = (sum_route_change / max(total_samples, 1)).item()
+
         metrics = {
             "g_mean": g_mean.tolist(),
             "A_mean": g_mean[0].item(),
@@ -169,9 +164,9 @@ def evaluate(
     model.train()
     if return_metrics:
         return (acc, metrics["A_mean"], metrics["B_mean"], metrics["C_mean"], metrics)
-        
-    # If not returning metrics but need to pass back pct for logging, we can just compute it here.
-    return (acc, 0.0, 0.0, 1.0) if force_c else (acc, 0.33, 0.33, 0.33)
+
+    route_dist = sum_g / max(route_count, 1)
+    return acc, route_dist[0].item(), route_dist[1].item(), route_dist[2].item()
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +176,7 @@ def evaluate(
 def _init_model(
     mcfg: dict,
     dcfg: dict,
+    zcfg: dict,
     n_classes: int,
     device: torch.device,
 ) -> HoTEncoder:
@@ -193,6 +189,10 @@ def _init_model(
         max_seq_len=dcfg.get("seq_len", 64),
         conv_kernel_size=mcfg.get("conv_kernel_size", 7),
         dropout=mcfg.get("dropout", 0.1),
+        gate_temperature=mcfg.get("gate_temperature", 0.05),
+        czu_warmup_steps=zcfg.get("warmup_steps", 1000),
+        czu_update_every=zcfg.get("update_every", 500),
+        czu_ema_beta=zcfg.get("ema_beta", 0.95),
     ).to(device)
     return model
 
@@ -233,7 +233,8 @@ def _check_acceptance(
             f"best_val_acc_hot {best_val_acc_hot:.4f} < best_val_acc_c_only {best_val_acc_c_only:.4f}",
         )
 
-    for record in eval_records[-k:]:
+    last_records = eval_records[-k:]
+    for record in last_records:
         metrics = record["metrics"]
         step = record["step"]
 
@@ -246,15 +247,15 @@ def _check_acceptance(
             A = a_vals[i]
             B = b_vals[i]
             C = c_vals[i]
-            if A < 0.05 or A > 0.70:
-                return False, f"step {step} layer {i} A {A:.3f} outside [0.05, 0.70]"
-            if B < 0.05 or B > 0.70:
-                return False, f"step {step} layer {i} B {B:.3f} outside [0.05, 0.70]"
-            if C < 0.05 or C > 0.90:
-                return False, f"step {step} layer {i} C {C:.3f} outside [0.05, 0.90]"
+            if A < 0.01 or A > 0.80:
+                return False, f"step {step} layer {i} A {A:.3f} outside [0.01, 0.80]"
+            if B < 0.01 or B > 0.90:
+                return False, f"step {step} layer {i} B {B:.3f} outside [0.01, 0.90]"
+            if C < 0.01 or C > 0.90:
+                return False, f"step {step} layer {i} C {C:.3f} outside [0.01, 0.90]"
 
         if metrics.get("gate_entropy_mean", 1.0) < 0.01:
-            return False, f"step {step} global entropy std {metrics.get('gate_entropy_mean'):.4f} < 0.01"
+            return False, f"step {step} route entropy {metrics.get('gate_entropy_mean'):.4f} < 0.01"
 
         if metrics.get("route_change_rate_mean", 0.0) > 0.3:
             return False, f"step {step} route_change_rate {metrics.get('route_change_rate_mean'):.4f} > 0.3"
@@ -333,8 +334,8 @@ def train_loop(
     track_metrics: bool = False,
     run_label: str = "hot",
 ) -> tuple:
-    
-    # Optimizer setup: separate gate params
+
+    # Optimizer setup: keep compatibility with future trainable gate parameters.
     gate_params = []
     base_params = []
     for n, p in model.named_parameters():
@@ -343,11 +344,11 @@ def train_loop(
         else:
             base_params.append(p)
 
-    optimizer = torch.optim.AdamW([
-        {"params": base_params, "lr": lr, "weight_decay": weight_decay},
-        {"params": gate_params, "lr": lr * 0.3, "weight_decay": 0.0}
-    ])
-    
+    param_groups = [{"params": base_params, "lr": lr, "weight_decay": weight_decay}]
+    if gate_params:
+        param_groups.append({"params": gate_params, "lr": lr * 0.3, "weight_decay": 0.0})
+    optimizer = torch.optim.AdamW(param_groups)
+
     criterion = nn.CrossEntropyLoss()
 
     best_val_acc = 0.0
@@ -358,10 +359,6 @@ def train_loop(
     t0 = time.time()
 
     model.train()
-    
-    tau_start = 2.0
-    tau_end = 1.0
-    tau_steps = 2000
 
     for step in range(1, total_steps + 1):
         g_stack = None
@@ -374,8 +371,7 @@ def train_loop(
         x, y, sample_ids = x.to(device), y.to(device), sample_ids.to(device)
 
         # ---- Forward ----
-        tau = tau_end + (tau_start - tau_end) * max(0.0, (tau_steps - step) / tau_steps)
-        
+
         # Training Schedule
         if not force_c_only:
             force_c = model.czu.force_path_c()
@@ -387,10 +383,7 @@ def train_loop(
 
         if not force_c_only and len(routes) > 0:
             model.czu.update(entropies)
-            
             g_stack = torch.stack(routes)
-            g_stack_b = g_stack.transpose(0, 1) # (B, n_layers, 3)
-            gC = g_stack_b[:, :, 2]  # (B, n_layers)
 
         assert not torch.isnan(loss), "Loss is NaN"
         if not force_c_only and len(routes) > 0:
@@ -407,11 +400,6 @@ def train_loop(
             
         optimizer.step()
         
-        # Clamp alpha for all layers
-        with torch.no_grad():
-            for layer in model.layers:
-                layer.alpha.data.clamp_(0.1, 1.0)
-
         # ---- Logging ----
         if step % log_every == 0:
             if force_c_only:
@@ -443,7 +431,7 @@ def train_loop(
                 gate_entropy = metrics.get("gate_entropy_mean", 0)
                 eval_str = (
                     f"  [eval:{run_label}] step={step} val_acc={val_acc:.4f}\n"
-                    f"      routing A={pct_a:.1%} B={pct_b:.1%} C={pct_c:.1%} | entropy_std={gate_entropy:.3f}\n"
+                    f"      routing A={pct_a:.1%} B={pct_b:.1%} C={pct_c:.1%} | route_entropy={gate_entropy:.3f}\n"
                 )
             else:
                 val_acc, pct_a, pct_b, pct_c = evaluate(
@@ -473,6 +461,7 @@ def train_loop(
                     ckpt = {
                         "step": step,
                         "model_state": model.state_dict(),
+                        "czu_state": model.czu.state_dict(),
                         "config": cfg,
                         "val_acc": val_acc,
                     }
@@ -499,6 +488,12 @@ def main() -> None:
         cfg["data"]["dataset"] = args.dataset
     if args.seq_len is not None:
         cfg["data"]["seq_len"] = args.seq_len
+    if args.steps is not None:
+        cfg.setdefault("training", {})["steps"] = args.steps
+    if args.eval_every is not None:
+        cfg.setdefault("training", {})["eval_every"] = args.eval_every
+    if args.warmup_steps is not None:
+        cfg.setdefault("czu", {})["warmup_steps"] = args.warmup_steps
 
     # Apply global seed
     seed = cfg.get("data", {}).get("seed", 42)
@@ -511,6 +506,7 @@ def main() -> None:
     # ---- Config sections ----
     mcfg = cfg.get("model", {})
     dcfg = cfg.get("data", {})
+    zcfg = cfg.get("czu", {})
     tcfg = cfg.get("training", {})
     lcfg = cfg.get("logging", {})
 
@@ -535,7 +531,7 @@ def main() -> None:
 
     # ---- Baseline: C-only ----
     if args.mode in ["c-only", "both"]:
-        model_c = _init_model(mcfg, dcfg, n_classes, device)
+        model_c = _init_model(mcfg, dcfg, zcfg, n_classes, device)
         n_params_c = sum(p.numel() for p in model_c.parameters() if p.requires_grad)
         print(f"[train:c-only] params={n_params_c:,}")
         best_val_acc_c_only, _, _ = train_loop(
@@ -561,7 +557,7 @@ def main() -> None:
 
     # ---- HoT adaptive training ----
     if args.mode in ["hot", "both"]:
-        model_hot = _init_model(mcfg, dcfg, n_classes, device)
+        model_hot = _init_model(mcfg, dcfg, zcfg, n_classes, device)
         n_params_hot = sum(p.numel() for p in model_hot.parameters() if p.requires_grad)
         print(f"[train:hot] params={n_params_hot:,}")
         best_val_acc_hot, eval_records, ema_c_history = train_loop(

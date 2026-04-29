@@ -1,126 +1,78 @@
-"""
-Comfort Zone Updater (CZU) for the Homeostatic Transformer.
+"""Comfort Zone Updater for Homeostatic Transformer layers."""
 
-The CZU manages per-layer entropy thresholds (H_low, H_high) used by the
-Homeostatic Gate to select a processing path (A / B / C).
+from __future__ import annotations
 
-Lifecycle
----------
-1. **Warmup** (step < warmup_steps):
-   All layers are forced to Path C (full attention).  Entropy values are
-   collected into a per-layer buffer.
-
-2. **Initialization** (first step after warmup):
-   H_low  = P10 of warmup entropies
-   H_high = P90 of warmup entropies
-   (A minimum gap of 0.05 is enforced between H_low and H_high.)
-
-3. **Running** (step >= warmup_steps):
-   Every ``update_every`` steps the thresholds are updated via EMA:
-       H_low  ← beta * H_low  + (1-beta) * P10(recent)
-       H_high ← beta * H_high + (1-beta) * P90(recent)
-"""
+from typing import Iterable
 
 import numpy as np
 
 
 class CZU:
-    """Comfort Zone Updater.
-
-    Args:
-        n_layers:      Number of HoT layers in the model.
-        warmup_steps:  Steps to force Path C and collect entropy stats (default 1000).
-        update_every:  Steps between EMA threshold updates after warmup (default 500).
-        ema_beta:          EMA decay factor for threshold updates (default 0.95).
-        init_H_low:        Default H_low before warmup finishes (default 0.3).
-        init_H_high:       Default H_high before warmup finishes (default 0.7).
-        min_threshold_gap: Minimum enforced gap between H_low and H_high (default 0.05).
-    """
+    """Maintain per-layer entropy thresholds using warmup percentiles and EMA."""
 
     def __init__(
         self,
         n_layers: int,
         warmup_steps: int = 1000,
-        update_every: int = 50,
+        update_every: int = 500,
         ema_beta: float = 0.95,
         init_H_low: float = 0.3,
         init_H_high: float = 0.7,
-        min_threshold_gap: float = 0.05,
+        min_threshold_gap: float = 0.0,
+        max_buffer_size: int = 20000,
     ) -> None:
         self.n_layers = n_layers
         self.warmup_steps = warmup_steps
         self.update_every = update_every
         self.ema_beta = ema_beta
-
         self.min_threshold_gap = min_threshold_gap
+        self.max_buffer_size = max_buffer_size
 
         self.step = 0
-        self.initialized = False   # True once thresholds are set from warmup data
+        self.initialized = False
 
-        # Per-layer thresholds (used before initialization as reasonable defaults)
-        self.H_low = [init_H_low] * n_layers
-        self.H_high = [init_H_high] * n_layers
-        self.e_min = [0.0] * n_layers
-        self.e_max = [1.0] * n_layers
+        self.H_low = [float(init_H_low)] * n_layers
+        self.H_high = [float(init_H_high)] * n_layers
 
-        # Entropy buffer collected during warmup
-        self._warmup_buf: list[list] = [[] for _ in range(n_layers)]
-
-        self._warmup_buf: list[list] = [[] for _ in range(n_layers)]
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+        self._warmup_buf: list[list[float]] = [[] for _ in range(n_layers)]
+        self._recent_buf: list[list[float]] = [[] for _ in range(n_layers)]
 
     @property
     def in_warmup(self) -> bool:
-        """True while step < warmup_steps."""
         return self.step < self.warmup_steps
 
     def force_path_c(self) -> bool:
-        """Returns True during the warmup phase (all layers use Path C)."""
         return self.in_warmup
 
-    def get_thresholds(self, layer_idx: int) -> tuple:
-        """Return ``(H_low, H_high, e_min, e_max)`` for the given layer index."""
-        return self.H_low[layer_idx], self.H_high[layer_idx], self.e_min[layer_idx], self.e_max[layer_idx]
+    def get_thresholds(self, layer_idx: int) -> tuple[float, float]:
+        if not self.in_warmup and not self.initialized:
+            self._init_from_warmup()
+            self.initialized = True
+        return self.H_low[layer_idx], self.H_high[layer_idx]
 
-    def get_all_thresholds(self) -> list:
-        """Return a list of ``(H_low, H_high, e_min, e_max)`` tuples, one per layer."""
-        return [(self.H_low[i], self.H_high[i], self.e_min[i], self.e_max[i]) for i in range(self.n_layers)]
+    def get_all_thresholds(self) -> list[tuple[float, float]]:
+        return [self.get_thresholds(i) for i in range(self.n_layers)]
 
-    def update(self, layer_entropies: list) -> None:
-        """Record entropy values for this training step and update thresholds.
-
-        Args:
-            layer_entropies: List of scalar entropy values (one per layer).
-                             Accepts Python floats or PyTorch scalar tensors.
-        """
-        vals = [
-            float(h.item()) if hasattr(h, "item") else float(h)
-            for h in layer_entropies
-        ]
+    def update(self, layer_entropies: Iterable) -> None:
+        """Record entropy observations and update thresholds when due."""
+        entropy_values = [self._to_float_list(v) for v in layer_entropies]
 
         if self.in_warmup:
-            for i, v in enumerate(layer_entropies):
-                self._warmup_buf[i].extend(v.tolist())
-                self._warmup_buf[i] = self._warmup_buf[i][-2000:]
+            for i, values in enumerate(entropy_values):
+                self._extend_bounded(self._warmup_buf[i], values)
         else:
-            # First step after warmup: initialize thresholds
             if not self.initialized:
                 self._init_from_warmup()
                 self.initialized = True
 
-            # Periodic EMA update using batch percentiles
-            steps_after = self.step - self.warmup_steps
-            if steps_after > 0 and steps_after % self.update_every == 0:
-                self._ema_update(layer_entropies)
+            for i, values in enumerate(entropy_values):
+                self._extend_bounded(self._recent_buf[i], values)
+
+            steps_after = self.step - self.warmup_steps + 1
+            if self.update_every > 0 and steps_after % self.update_every == 0:
+                self._ema_update_from_recent()
 
         self.step += 1
-
-    # ------------------------------------------------------------------
-    # State dict (for checkpointing)
-    # ------------------------------------------------------------------
 
     def state_dict(self) -> dict:
         return {
@@ -128,59 +80,90 @@ class CZU:
             "initialized": self.initialized,
             "H_low": list(self.H_low),
             "H_high": list(self.H_high),
-            "e_min": list(self.e_min),
-            "e_max": list(self.e_max),
+            "warmup_steps": self.warmup_steps,
+            "update_every": self.update_every,
+            "ema_beta": self.ema_beta,
+            "min_threshold_gap": self.min_threshold_gap,
+            "_warmup_buf": [list(buf) for buf in self._warmup_buf],
+            "_recent_buf": [list(buf) for buf in self._recent_buf],
         }
 
     def load_state_dict(self, state: dict) -> None:
-        self.step = state["step"]
-        self.initialized = state["initialized"]
-        self.H_low = list(state["H_low"])
-        self.H_high = list(state["H_high"])
-        self.e_min = list(state.get("e_min", [0.0] * self.n_layers))
-        self.e_max = list(state.get("e_max", [1.0] * self.n_layers))
+        self.step = int(state.get("step", 0))
+        self.initialized = bool(state.get("initialized", False))
+        self.H_low = [float(v) for v in state.get("H_low", self.H_low)]
+        self.H_high = [float(v) for v in state.get("H_high", self.H_high)]
+        self.warmup_steps = int(state.get("warmup_steps", self.warmup_steps))
+        self.update_every = int(state.get("update_every", self.update_every))
+        self.ema_beta = float(state.get("ema_beta", self.ema_beta))
+        self.min_threshold_gap = float(state.get("min_threshold_gap", self.min_threshold_gap))
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
+        warmup_buf = state.get("_warmup_buf")
+        recent_buf = state.get("_recent_buf")
+        if warmup_buf is not None:
+            self._warmup_buf = [[float(v) for v in buf] for buf in warmup_buf]
+        if recent_buf is not None:
+            self._recent_buf = [[float(v) for v in buf] for buf in recent_buf]
+
+        self._enforce_constraints()
+
+    def _to_float_list(self, values) -> list[float]:
+        if hasattr(values, "detach"):
+            values = values.detach().flatten().cpu().tolist()
+        elif hasattr(values, "flatten"):
+            values = values.flatten().tolist()
+        elif isinstance(values, (float, int)):
+            values = [values]
+        else:
+            values = list(values)
+        return [float(v) for v in values]
+
+    def _extend_bounded(self, buf: list[float], values: list[float]) -> None:
+        buf.extend(values)
+        if len(buf) > self.max_buffer_size:
+            del buf[: len(buf) - self.max_buffer_size]
 
     def _init_from_warmup(self) -> None:
-        """Initialize bounds from warmup entropies."""
-        for i in range(self.n_layers):
-            buf = np.array(self._warmup_buf[i])
-            if len(buf) >= 2:
-                low = float(np.percentile(buf, 10))
-                high = float(np.percentile(buf, 90))
-                
-                self.e_min[i] = float(np.percentile(buf, 5))
-                self.e_max[i] = float(np.percentile(buf, 95))
-
-                self.H_low[i] = low
-                self.H_high[i] = high
-
+        for i, buf in enumerate(self._warmup_buf):
+            if len(buf) == 0:
+                continue
+            arr = np.asarray(buf, dtype=np.float64)
+            self.H_low[i] = float(np.percentile(arr, 10))
+            self.H_high[i] = float(np.percentile(arr, 90))
         self._enforce_constraints()
 
-    def _ema_update(self, layer_entropies: list) -> None:
-        """Update thresholds via EMA directly on batch percentiles."""
-        for i, entropy_tensor in enumerate(layer_entropies):
-            current_p10 = float(torch.quantile(entropy_tensor, 0.1).item())
-            current_p90 = float(torch.quantile(entropy_tensor, 0.9).item())
-            
-            b = self.ema_beta
-            self.H_low[i] = b * self.H_low[i] + (1.0 - b) * current_p10
-            self.H_high[i] = b * self.H_high[i] + (1.0 - b) * current_p90
-
+    def _ema_update_from_recent(self) -> None:
+        for i, buf in enumerate(self._recent_buf):
+            if len(buf) == 0:
+                continue
+            arr = np.asarray(buf, dtype=np.float64)
+            p10 = float(np.percentile(arr, 10))
+            p90 = float(np.percentile(arr, 90))
+            beta = self.ema_beta
+            self.H_low[i] = beta * self.H_low[i] + (1.0 - beta) * p10
+            self.H_high[i] = beta * self.H_high[i] + (1.0 - beta) * p90
+            buf.clear()
         self._enforce_constraints()
-        
+
     def _enforce_constraints(self) -> None:
         for i in range(self.n_layers):
-            H_low = max(0.0, min(self.H_low[i], 1.0))
-            H_high = max(0.0, min(self.H_high[i], 1.0))
+            low = min(max(float(self.H_low[i]), 0.0), 1.0)
+            high = min(max(float(self.H_high[i]), 0.0), 1.0)
 
-            if H_high - H_low < self.min_threshold_gap:
-                mid = 0.5 * (H_low + H_high)
-                H_low = mid - 0.5 * self.min_threshold_gap
-                H_high = mid + 0.5 * self.min_threshold_gap
+            if high < low:
+                low, high = high, low
 
-            self.H_low[i] = max(0.0, min(H_low, 1.0))
-            self.H_high[i] = max(0.0, min(H_high, 1.0))
+            if high - low < self.min_threshold_gap:
+                mid = 0.5 * (low + high)
+                low = mid - 0.5 * self.min_threshold_gap
+                high = mid + 0.5 * self.min_threshold_gap
+
+            if low < 0.0:
+                high = min(1.0, high - low)
+                low = 0.0
+            if high > 1.0:
+                low = max(0.0, low - (high - 1.0))
+                high = 1.0
+
+            self.H_low[i] = low
+            self.H_high[i] = high
