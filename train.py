@@ -15,7 +15,10 @@ import os
 import time
 from datetime import datetime
 import statistics
+import random
+import json
 
+import numpy as np
 import torch
 import torch.nn as nn
 import yaml
@@ -31,7 +34,22 @@ from hot.data import get_dataloaders
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train Homeostatic Transformer (HoT)")
     parser.add_argument("--config", required=True, help="Path to YAML config file")
+    parser.add_argument("--seed", type=int, default=None, help="Override random seed")
+    parser.add_argument("--dataset", type=str, default=None, help="Override dataset name")
+    parser.add_argument("--seq_len", type=int, default=None, help="Override sequence length")
+    parser.add_argument("--mode", type=str, choices=["c-only", "hot", "both"], default="both", help="Which model to run")
+    parser.add_argument("--json_output", action="store_true", help="Print final results as JSON")
     return parser.parse_args()
+
+
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    # Ensuring determinism for CuDNN
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 # ---------------------------------------------------------------------------
@@ -393,6 +411,10 @@ def train_loop(
         else:
             loss = loss_task
 
+        assert not torch.isnan(loss), "Loss is NaN"
+        if not force_c_only and len(routes) > 0:
+            assert not torch.isnan(g_stack).any(), "Gate probabilities contain NaN"
+
         # ---- Backward ----
         optimizer.zero_grad()
         loss.backward()
@@ -492,6 +514,18 @@ def main() -> None:
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
 
+    # ---- Overrides ----
+    if args.seed is not None:
+        cfg["data"]["seed"] = args.seed
+    if args.dataset is not None:
+        cfg["data"]["dataset"] = args.dataset
+    if args.seq_len is not None:
+        cfg["data"]["seq_len"] = args.seq_len
+
+    # Apply global seed
+    seed = cfg.get("data", {}).get("seed", 42)
+    set_seed(seed)
+
     # ---- Device ----
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[train] device={device}")
@@ -519,61 +553,85 @@ def main() -> None:
     os.makedirs(run_dir, exist_ok=True)
     print(f"[train] run_dir={run_dir}")
 
+    results = {}
+
     # ---- Baseline: C-only ----
-    model_c = _init_model(mcfg, dcfg, n_classes, device)
-    n_params = sum(p.numel() for p in model_c.parameters() if p.requires_grad)
-    print(f"[train:c-only] params={n_params:,}")
-    best_val_acc_c_only, _, _ = train_loop(
-        model_c,
-        cfg,
-        train_loader,
-        val_loader,
-        device,
-        total_steps,
-        eval_every,
-        log_every,
-        grad_clip,
-        tcfg.get("lr", 1e-3),
-        tcfg.get("weight_decay", 1e-2),
-        run_dir=None,
-        force_c_only=True,
-        track_metrics=False,
-        run_label="c-only",
-    )
+    if args.mode in ["c-only", "both"]:
+        model_c = _init_model(mcfg, dcfg, n_classes, device)
+        n_params_c = sum(p.numel() for p in model_c.parameters() if p.requires_grad)
+        print(f"[train:c-only] params={n_params_c:,}")
+        best_val_acc_c_only, _, _ = train_loop(
+            model_c,
+            cfg,
+            train_loader,
+            val_loader,
+            device,
+            total_steps,
+            eval_every,
+            log_every,
+            grad_clip,
+            tcfg.get("lr", 1e-3),
+            tcfg.get("weight_decay", 1e-2),
+            run_dir=None,
+            force_c_only=True,
+            track_metrics=False,
+            run_label="c-only",
+        )
+        results["c_only"] = {"best_val_acc": best_val_acc_c_only, "params": n_params_c}
+    else:
+        best_val_acc_c_only = 0.0
 
     # ---- HoT adaptive training ----
-    model_hot = _init_model(mcfg, dcfg, n_classes, device)
-    n_params = sum(p.numel() for p in model_hot.parameters() if p.requires_grad)
-    print(f"[train:hot] params={n_params:,}")
-    best_val_acc_hot, eval_records, ema_c_history = train_loop(
-        model_hot,
-        cfg,
-        train_loader,
-        val_loader,
-        device,
-        total_steps,
-        eval_every,
-        log_every,
-        grad_clip,
-        tcfg.get("lr", 1e-3),
-        tcfg.get("weight_decay", 1e-2),
-        run_dir=run_dir,
-        force_c_only=False,
-        track_metrics=True,
-        run_label="hot",
-    )
+    if args.mode in ["hot", "both"]:
+        model_hot = _init_model(mcfg, dcfg, n_classes, device)
+        n_params_hot = sum(p.numel() for p in model_hot.parameters() if p.requires_grad)
+        print(f"[train:hot] params={n_params_hot:,}")
+        best_val_acc_hot, eval_records, ema_c_history = train_loop(
+            model_hot,
+            cfg,
+            train_loader,
+            val_loader,
+            device,
+            total_steps,
+            eval_every,
+            log_every,
+            grad_clip,
+            tcfg.get("lr", 1e-3),
+            tcfg.get("weight_decay", 1e-2),
+            run_dir=run_dir,
+            force_c_only=False,
+            track_metrics=True,
+            run_label="hot",
+        )
+        
+        last_metrics = eval_records[-1]["metrics"] if eval_records else {}
+        results["hot"] = {
+            "best_val_acc": best_val_acc_hot,
+            "params": n_params_hot,
+            "A_mean": last_metrics.get("A_mean", 0.0),
+            "B_mean": last_metrics.get("B_mean", 0.0),
+            "C_mean": last_metrics.get("C_mean", 0.0),
+            "gate_entropy": last_metrics.get("gate_entropy_mean", 0.0),
+            "c_mean_history": ema_c_history,
+        }
 
-    passed, reason = _check_acceptance(
-        eval_records, best_val_acc_hot, best_val_acc_c_only, k=5,
-    )
-    _print_final_report(
-        best_val_acc_hot,
-        best_val_acc_c_only,
-        eval_records,
-        passed,
-        reason,
-        k=5,
-    )
+        if args.mode == "both":
+            passed, reason = _check_acceptance(
+                eval_records, best_val_acc_hot, best_val_acc_c_only, k=5,
+            )
+            _print_final_report(
+                best_val_acc_hot,
+                best_val_acc_c_only,
+                eval_records,
+                passed,
+                reason,
+                k=5,
+            )
+
+    if args.json_output:
+        print("JSON_OUTPUT_START")
+        print(json.dumps(results))
+        print("JSON_OUTPUT_END")
 
 
 if __name__ == "__main__":
