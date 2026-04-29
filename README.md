@@ -23,11 +23,11 @@ information complexity.
 #### Output Entropy Monitor (OEM)
 
 At every layer, the OEM computes a normalized Shannon entropy over the layer
-output.  The representation is averaged over the sequence dimension, passed
-through a softmax, and the resulting distribution's entropy is divided by
-log(D) to obtain a value in **[0, 1]**:
+representation.  For each sequence position, the feature vector is converted
+to a distribution with softmax; token entropies are averaged over the sequence
+and divided by log(D) to obtain a value in **[0, 1]**:
 
-    H = -Σ p_i log(p_i)  /  log(D)
+    H = -(1/N) Σ_i Σ_j p(i,j) log p(i,j) / log(D)
 
 A value near 0 means the layer output is highly concentrated (low surprise);
 a value near 1 means it is nearly uniform (high uncertainty).
@@ -45,9 +45,10 @@ and makes a **discrete routing decision for the whole sequence** (not per-token)
 | H_low ≤ H ≤ H_high | **B** | Depthwise-sep 1-D conv    | O(N · k)  |
 | H > H_high         | **C** | Full multi-head attention | O(N²)      |
 
-**Gradient flow**: during training a soft (sigmoid-weighted) blend of all
-paths is used so that gradients flow through the gate signal and through each
-path.  During evaluation the gate is applied as a hard discrete decision.
+**Gradient flow**: the forward decision is discrete. During training, a
+straight-through sigmoid relaxation is used around the two gate boundaries so
+that gradients can flow while the executed route remains one of A/B/C. During
+evaluation the gate is applied as a hard discrete decision.
 
 ---
 
@@ -57,7 +58,7 @@ After the selected path computes its output, the layer applies:
 
     x_next = LayerNorm(x + α · path_output)
 
-where **α** is a learned scalar per layer (initialized to 0.1).
+where **α** is a learned scalar per layer (initialized to 1.0).
 
 ---
 
@@ -156,8 +157,8 @@ Expected output (T4 GPU, ~2 minutes):
 
 ```
 [train] device=cuda
-[train] params=76,994
-step=100/10000 loss=0.6883 phase=warmup A=0.00% B=0.00% C=100.00% ...
+[train:hot] params=90,374
+[train:hot] step=100/10000 loss=0.6883 A=0.00% B=0.00% C=100.00% ...
 ...
   [eval] step=500  val_acc=0.8200 routing A=0.0% B=52.4% C=47.6%
 ...
@@ -175,7 +176,7 @@ step=100/10000 loss=0.6883 phase=warmup A=0.00% B=0.00% C=100.00% ...
 | `model.n_layers`            | 4       | Number of HoT layers                          |
 | `model.n_heads`             | 4       | Attention heads (Path C)                       |
 | `model.conv_kernel_size`    | 7       | Convolution kernel size (Path B)               |
-| `model.gate_temperature`    | 0.05    | Sigmoid temperature for soft routing           |
+| `model.gate_temperature`    | 0.05    | Sigmoid temperature for ST boundary relaxation |
 | `data.dataset`              | `synthetic_bracket` | Task name                        |
 | `data.seq_len`              | 64      | Sequence length                                |
 | `data.batch_size`           | 32      | Mini-batch size                                |
