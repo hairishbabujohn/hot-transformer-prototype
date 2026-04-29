@@ -76,6 +76,10 @@ def evaluate(
     sum_ratios = torch.zeros(3, device=device)
     sum_g_layer = torch.zeros(n_layers, 3, device=device)
     sum_ratio_layer = torch.zeros(n_layers, 3, device=device)
+    
+    all_losses = []
+    all_gC = []
+    criterion_none = nn.CrossEntropyLoss(reduction='none')
 
     for x, y in val_loader:
         x, y = x.to(device), y.to(device)
@@ -95,6 +99,15 @@ def evaluate(
         if return_metrics:
             batch_size = x.size(0)
             total_samples += batch_size
+            
+            loss_batch = criterion_none(logits, y)
+            all_losses.append(loss_batch.detach())
+            
+            # Stack routes: (n_layers, B, 3)
+            g_stack = torch.stack(routes) # (L, B, 3)
+            g_mean_batch = g_stack.mean(dim=0) # (B, 3)
+            all_gC.append(g_mean_batch[:, 2].detach())
+            
             for layer_idx, diag in enumerate(diagnostics):
                 g = diag["g"].to(device)
                 impacts = torch.stack([diag["A_impact"], diag["B_impact"], diag["C_impact"]]).to(device)
@@ -129,6 +142,21 @@ def evaluate(
 
         impact_norm = impact_mean / (impact_mean.sum() + 1e-9)
         alignment_error = (g_mean - impact_norm).abs().sum().item()
+        
+        C_high, C_low = 0.0, 0.0
+        if len(all_losses) > 0:
+            all_losses_t = torch.cat(all_losses)
+            all_gC_t = torch.cat(all_gC)
+            
+            sorted_idx = torch.argsort(all_losses_t)
+            N_samples = len(sorted_idx)
+            top_30_idx = sorted_idx[int(0.7 * N_samples):]
+            bot_30_idx = sorted_idx[:int(0.3 * N_samples)]
+            
+            if len(top_30_idx) > 0:
+                C_high = all_gC_t[top_30_idx].mean().item()
+            if len(bot_30_idx) > 0:
+                C_low = all_gC_t[bot_30_idx].mean().item()
 
         metrics = {
             "g_mean": g_mean.tolist(),
@@ -147,6 +175,8 @@ def evaluate(
             "B_ratio_layer_mean": ratio_layer_mean[:, 1].tolist(),
             "C_ratio_layer_mean": ratio_layer_mean[:, 2].tolist(),
             "alignment_error": alignment_error,
+            "C_high": C_high,
+            "C_low": C_low,
         }
 
     model.train()
@@ -216,10 +246,13 @@ def _check_acceptance(
             f"best_val_acc_hot {best_val_acc_hot:.4f} < best_val_acc_c_only {best_val_acc_c_only:.4f}",
         )
 
-    last_records = eval_records[-k:]
     for record in last_records:
         metrics = record["metrics"]
         step = record["step"]
+        
+        c_diff = metrics.get("C_high", 0) - metrics.get("C_low", 0)
+        if c_diff < 0.07:
+            return False, f"step {step} C_high - C_low {c_diff:.3f} < 0.07"
 
         if metrics["A_mean"] < 0.05:
             return False, f"step {step} A_mean {metrics['A_mean']:.3f} < 0.05"
@@ -301,6 +334,7 @@ def _print_final_report(
                 f"A_ratio={metrics['A_ratio_mean']:.3f} "
                 f"B_ratio={metrics['B_ratio_mean']:.3f} "
                 f"C_ratio={metrics['C_ratio_mean']:.3f} "
+                f"C_high-C_low={metrics.get('C_high', 0) - metrics.get('C_low', 0):.3f} "
                 f"alignment_error={metrics['alignment_error']:.3f} "
                 f"min_A_layer={worst['min_a_val']:.3f}(L{worst['min_a_idx']}) "
                 f"min_B_layer={worst['min_b_val']:.3f}(L{worst['min_b_idx']}) "
@@ -367,12 +401,11 @@ def train_loop(
     tau_end = 1.0
     tau_steps = 2000
 
-    lambda_c = 0.02
-    delta_c = 0.05
-    lambda_bal = 0.01
-    lambda_entropy = 0.005
+    lambda_c = 0.05
+    lambda_bal = 0.02
+    lambda_entropy = 0.01
     
-    target_bal = torch.tensor([0.2, 0.3, 0.5], device=device)
+    target_bal = torch.tensor([0.3, 0.4, 0.3], device=device)
 
     for step in range(1, total_steps + 1):
         # ---- Fetch batch ----
@@ -386,30 +419,42 @@ def train_loop(
         # ---- Forward ----
         tau = tau_end + (tau_start - tau_end) * max(0.0, (tau_steps - step) / tau_steps)
         
-        logits, oem_vals, routes = model(x, tau=tau, force_c=force_c_only)
+        # Training Schedule
+        if not force_c_only:
+            force_c = True if step <= 500 else False
+        else:
+            force_c = True
+        
+        logits, oem_vals, routes = model(x, tau=tau, force_c=force_c)
         loss_task = criterion(logits, y)
 
-        if not force_c_only and len(routes) > 0:
-            # Stack routes: (n_layers, B, 3)
-            g_stack = torch.stack(routes)
-            # Compute penalty
-            loss_c = lambda_c * g_stack[:, :, 2].mean()
-            
-            # Minimum attention constraint
-            loss_min_c = delta_c * torch.relu(0.05 - g_stack[:, :, 2].mean())
-            
-            # Balance regularization
-            g_mean_total = g_stack.mean(dim=(0, 1)) # (3,)
-            loss_bal = lambda_bal * ((g_mean_total - target_bal)**2).sum()
-            
-            # Gate entropy regularization
-            # Note: g_stack contains softmax probabilities.
-            g_entropy = -(g_stack * torch.log(g_stack + 1e-9)).sum(dim=-1).mean()
-            loss_ent = lambda_entropy * (1.0 - g_entropy)
-            
-            loss = loss_task + loss_c + loss_min_c + loss_bal + loss_ent
+        if not force_c and len(routes) > 0:
+            if step <= 2000:
+                loss = loss_task
+                loss_c = torch.tensor(0.0)
+                loss_bal = torch.tensor(0.0)
+                loss_ent = torch.tensor(0.0)
+            else:
+                # Stack routes: (n_layers, B, 3)
+                g_stack = torch.stack(routes)
+                
+                # Compute targeted penalty: lambda * |gC.mean() - 0.25|
+                loss_c = lambda_c * (g_stack[:, :, 2].mean() - 0.25).abs()
+                
+                # Balance regularization against [0.3, 0.4, 0.3] (MSE)
+                g_mean_total = g_stack.mean(dim=(0, 1)) # (3,)
+                loss_bal = lambda_bal * (g_mean_total - target_bal).pow(2).sum()
+                
+                # Gate entropy regularization
+                g_entropy = -(g_stack * torch.log(g_stack + 1e-9)).sum(dim=-1).mean()
+                loss_ent = -lambda_entropy * g_entropy
+                
+                loss = loss_task + loss_c + loss_bal + loss_ent
         else:
             loss = loss_task
+            loss_c = torch.tensor(0.0)
+            loss_bal = torch.tensor(0.0)
+            loss_ent = torch.tensor(0.0)
 
         assert not torch.isnan(loss), "Loss is NaN"
         if not force_c_only and len(routes) > 0:
@@ -446,10 +491,10 @@ def train_loop(
             alpha_str = " ".join(f"L{i}:{layer.alpha.item():.2f}" for i, layer in enumerate(model.layers))
             
             # loss_breakdown
-            if force_c_only:
+            if force_c_only or step <= 2000:
                 loss_str = f"loss={loss.item():.4f}"
             else:
-                loss_str = f"task={loss_task.item():.4f} c={loss_c.item():.4f} min_c={loss_min_c.item():.4f} bal={loss_bal.item():.4f} ent={loss_ent.item():.4f} tot={loss.item():.4f}"
+                loss_str = f"task={loss_task.item():.4f} c={loss_c.item():.4f} bal={loss_bal.item():.4f} ent={loss_ent.item():.4f} tot={loss.item():.4f}"
 
             print(
                 f"[train:{run_label}] step={step}/{total_steps} {loss_str} "
@@ -465,16 +510,16 @@ def train_loop(
                 val_acc, pct_a, pct_b, pct_c, metrics = evaluate(
                     model, val_loader, device, return_metrics=True, force_c=force_c_only,
                 )
+                c_diff = metrics.get("C_high", 0) - metrics.get("C_low", 0)
+                eval_str = f"  [eval:{run_label}] step={step} val_acc={val_acc:.4f} routing A={pct_a:.1%} B={pct_b:.1%} C={pct_c:.1%} (C_high-C_low={c_diff:.3f})"
             else:
                 val_acc, pct_a, pct_b, pct_c = evaluate(
                     model, val_loader, device, return_metrics=False, force_c=force_c_only,
                 )
                 metrics = None
+                eval_str = f"  [eval:{run_label}] step={step} val_acc={val_acc:.4f} routing A={pct_a:.1%} B={pct_b:.1%} C={pct_c:.1%}"
                 
-            print(
-                f"  [eval:{run_label}] step={step} val_acc={val_acc:.4f} "
-                f"routing A={pct_a:.1%} B={pct_b:.1%} C={pct_c:.1%}"
-            )
+            print(eval_str)
             
             if track_metrics:
                 c_mean = metrics["C_mean"]

@@ -17,36 +17,27 @@ import torch.nn.functional as F
 
 
 # ---------------------------------------------------------------------------
-# Output Entropy Monitor (OEM)
+# Token Entropy Variance (Difficulty Proxy)
 # ---------------------------------------------------------------------------
 
-def compute_oem(x: torch.Tensor) -> torch.Tensor:
-    """Compute normalized Shannon entropy of the layer output per sequence.
-
-    A softmax distribution is built by averaging the representation over the
-    sequence dimension, then treating the D-dimensional vector as logits.
-    Entropy is normalized by log(D) so the result lies in [0, 1].
+def compute_token_entropy_variance(x: torch.Tensor) -> torch.Tensor:
+    """Compute variance of token-level Shannon entropy over the sequence.
 
     Args:
         x: Tensor of shape (B, N, D).
 
     Returns:
-        Tensor of shape (B,) -- normalized entropy across the batch.
+        Tensor of shape (B,) -- entropy variance.
     """
-    B, N, D = x.shape
-    # Average over sequence positions -> (B, D) "summary" logits
-    x_mean = x.mean(dim=1)
-
-    # Numerically stable log-probabilities via log-softmax
-    log_probs = F.log_softmax(x_mean, dim=-1)      # (B, D)
-    probs = log_probs.exp()                         # (B, D)
-
-    # Shannon entropy: H = -sum(p * log(p)); use log_probs for numerical safety
-    entropy = -(probs * log_probs).nan_to_num(0.0).sum(dim=-1)  # (B,)
-
-    # Normalize to [0, 1]
-    normalized = entropy / math.log(max(D, 2))     # (B,)
-    return normalized
+    # Softmax over channel dimension to treat it as a distribution
+    p = F.softmax(x, dim=-1)
+    
+    # Token-level entropy
+    token_entropy = -(p * torch.log(p + 1e-9)).sum(dim=-1)  # (B, N)
+    
+    # Variance across sequence dimension
+    difficulty = token_entropy.var(dim=1, unbiased=False)   # (B,)
+    return difficulty
 
 
 # ---------------------------------------------------------------------------
@@ -112,12 +103,12 @@ class TrainableGate(nn.Module):
         nn.init.zeros_(self.mlp[2].weight)
         nn.init.zeros_(self.mlp[2].bias)
 
-    def forward(self, x: torch.Tensor, oem_val: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, difficulty: torch.Tensor) -> torch.Tensor:
         """
         Extract features and compute gate logits.
         Args:
             x: (B, N, D)
-            oem_val: (B,)
+            difficulty: (B,)
         Returns:
             logits: (B, 3)
         """
@@ -125,14 +116,14 @@ class TrainableGate(nn.Module):
         x_mean = x.mean(dim=(1, 2))  # (B,)
         x_var = x.var(dim=(1, 2), unbiased=False)  # (B,)
         
-        # Norms
-        x_norm = torch.linalg.norm(x.reshape(B, -1), dim=-1) # (B,)
-        
         # Temporal difference
         x_diff = x[:, 1:, :] - x[:, :-1, :]
         t_diff = torch.linalg.norm(x_diff.reshape(B, -1), dim=-1) # (B,)
         
-        features = torch.stack([x_mean, x_var, x_norm, t_diff, oem_val], dim=-1) # (B, 5)
+        # Channel variance
+        channel_var = x.var(dim=2, unbiased=False).mean(dim=1) # (B,)
+        
+        features = torch.stack([x_mean, x_var, t_diff, channel_var, difficulty], dim=-1) # (B, 5)
         features = self.norm(features)
         
         logits = self.mlp(features) # (B, 3)
@@ -217,7 +208,7 @@ class HoTLayer(nn.Module):
 
         Returns:
             x_next:     Output tensor (B, N, D).
-            oem_val:    Scalar entropy tensor.
+            difficulty: Scalar entropy variance tensor.
             route_info: Tensor [B, 3] of soft gate weights.
             diagnostics: Optional dict of diagnostics.
         """
@@ -225,11 +216,11 @@ class HoTLayer(nn.Module):
         # --- Pre-norm ---
         x_norm = self.norm_pre(x)
 
-        # --- Output Entropy Monitor ---
-        oem_val = compute_oem(x_norm) # (B,)
+        # --- Token Entropy Variance (Difficulty) ---
+        difficulty = compute_token_entropy_variance(x_norm) # (B,)
 
         # --- Homeostatic Gate ---
-        gate_logits = self.gate(x_norm, oem_val) # (B, 3)
+        gate_logits = self.gate(x_norm, difficulty) # (B, 3)
         if force_c:
             g = torch.tensor([0.0, 0.0, 1.0], device=x.device, dtype=x.dtype).unsqueeze(0).expand(B, -1)
         else:
@@ -256,7 +247,7 @@ class HoTLayer(nn.Module):
         x_next = x + self.alpha * path_out
 
         if not return_diagnostics:
-            return x_next, oem_val.mean(), g
+            return x_next, difficulty.mean(), g
 
         # Note: Do not detach g here, we want diagnostics/metrics to be computable
         g_mean = g.mean(dim=0).detach() # (3,)
